@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>服务器配置工作台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">信</div>
+        <div class="brand-text">
+          <div class="brand-title">服务器配置工作台</div>
+          <div class="brand-sub">配置 · 架构 · 报价</div>
+        </div>
+      </div>
+      <nav id="nav"></nav>
+      <div class="sidebar-foot" id="verBadge"></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="crumb" id="crumb">概览</div>
+        <div class="topbar-right">
+          <span class="ver-pill" id="verPill">单价库版本：—</span>
+          <span class="tax-pill" id="taxPill">税率 —</span>
+        </div>
+      </header>
+      <section class="content" id="content"></section>
+    </main>
+  </div>
+
+  <div class="modal-mask" id="modalMask" hidden>
+    <div class="modal" id="modal"></div>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="arch-graph.js"></script>
+  <script src="arch-diagram.js"></script>
+  <script src="hcl-core.js"></script>
+  <script src="xlsx-read.js"></script>
+  <script src="hcl-view.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
