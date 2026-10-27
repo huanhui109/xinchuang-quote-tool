@@ -1,0 +1,62 @@
+{
+ "name": "sample-free-text-list.xlsx",
+ "sheets": [
+  {
+   "name": "性能版（海光）",
+   "rows": [
+    [
+     "性能版配置清单（示例）"
+    ],
+    [
+     "部署应用",
+     "服务器配置",
+     "服务器类型",
+     "数量"
+    ],
+    [
+     "OCP操作机",
+     "Hygon5480 (32C/2.5GHz) *2  32G DDR4 2933MHz ECC RDIMM *4\n1.92T（SSD_SATA）*2\n1GE（电口）*4\n10GE（光口,含光模块）*2\n2G级存支持RAIDO,1,5,6等(含超级电容)*1\n支持热插拔(白金电源)*2\n",
+     "物理机",
+     1
+    ],
+    [
+     "数据库集群",
+     "Hygon 7470 (48C/2. 6GHz) *2 32G DDR4 2933MHz ECC RDIMM *16\n480G（SSD_SATA)*2    3.84T NVMe *6\n1GE（电口）*4\n10GE（光口,含光模块）*2\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2\n",
+     "物理机",
+     3
+    ],
+    [
+     "应用服务",
+     "Hygon 5480 (32C/2. 5GHz) *2\n32G DDR4 2933MHz ECC RDIMM *2\n480G SSD_SATA 固态硬盘 *2\n10GE（光口,含光模块）*2\n1GE（电口）*4\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2",
+     "物理机",
+     1
+    ],
+    [
+     "指令中心与统一清算，zookeeper*1，kafka*1",
+     "Hygon 5480 (32C/2. 5GHz) *2\n32G DDR4 2933MHz ECC RDIMM *6\n480G SSD_SATA 固态硬盘 *2\n10GE（光口,含光模块）*2\n1GE（电口）*4\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2\n",
+     "物理机",
+     2
+    ],
+    [
+     "运营中心与计量中心、zookeeper*2，kafka*2",
+     "Hygon 5480 (32C/2. 5GHz) *2\n32G DDR4 2933MHz ECC RDIMM *4\n480G SSD_SATA 固态硬盘 *2\n10GE（光口,含光模块）*2\n1GE（电口）*4\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2\n",
+     "物理机",
+     2
+    ],
+    [
+     "合规风控",
+     "Hygon 7470 (48C/2. 6GHz) *2\n32G DDR4 2933MHz ECC RDIMM *4\n960G SSD_SATA 固态硬盘 *2\n10GE（光口,含光模块）*2\n1GE（电口）*4\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2",
+     "物理机",
+     3
+    ],
+    [
+     "接入网关与前置服务",
+     "Hygon 7470 (48C/2. 6GHz) *2\n32G DDR4 2933MHz ECC RDIMM *4\n480G SSD_SATA 固态硬盘 *2\n10GE（光口,含光模块）*2\n1GE（电口）*4\n2G级存 支持RAIDO,1,5,6等（含超级电容）*1\n支持热插拔（白金电源）*2\n",
+     "物理机",
+     2
+    ]
+   ],
+   "truncated": false
+  }
+ ]
+}

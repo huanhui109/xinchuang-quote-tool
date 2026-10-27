@@ -1,0 +1,260 @@
+{
+  "_seq": 200,
+  "settings": {
+    "tax_rate": "0.13",
+    "currency": "CNY"
+  },
+  "versions": [
+    {
+      "id": 1,
+      "name": "基线 v1（示例）",
+      "note": "示例基线：国产 CPU 物理机与虚拟机资源综合单价（可在「数据」页修改）",
+      "created_at": "2026-10-27 13:17",
+      "is_active": 1
+    }
+  ],
+  "machines": [
+    {
+      "id": 1,
+      "version_id": 1,
+      "brand": "海光",
+      "model": "Hygon 5480",
+      "arch": "海光(C86/x86)",
+      "cpu_model": "Hygon 5480",
+      "cpu_sockets": 2,
+      "cpu_cores": 32,
+      "cpu_freq": 2.5,
+      "mem_capacity": 256,
+      "mem_gen": "DDR4",
+      "disk_bays": "8",
+      "disk_desc": "2×960G SSD + 4×1.92T NVMe",
+      "nic": "4×25GbE",
+      "power": "2×800W",
+      "rail": "2U导轨",
+      "unit_price_cents": 8600000,
+      "supplier": "厂商询价(示例)",
+      "basis": "示例价，待替换"
+    },
+    {
+      "id": 2,
+      "version_id": 1,
+      "brand": "海光",
+      "model": "Hygon 7470",
+      "arch": "海光(C86/x86)",
+      "cpu_model": "Hygon 7470",
+      "cpu_sockets": 2,
+      "cpu_cores": 48,
+      "cpu_freq": 2.6,
+      "mem_capacity": 512,
+      "mem_gen": "DDR4",
+      "disk_bays": "8",
+      "disk_desc": "4×1.92T NVMe + 4×3.84T NVMe",
+      "nic": "4×25GbE",
+      "power": "2×1200W",
+      "rail": "2U导轨",
+      "unit_price_cents": 15800000,
+      "supplier": "厂商询价(示例)",
+      "basis": "示例价，待替换"
+    },
+    {
+      "id": 3,
+      "version_id": 1,
+      "brand": "鲲鹏",
+      "model": "Kunpeng 920",
+      "arch": "鲲鹏(ARM)",
+      "cpu_model": "Kunpeng 920",
+      "cpu_sockets": 2,
+      "cpu_cores": 64,
+      "cpu_freq": 2.6,
+      "mem_capacity": 512,
+      "mem_gen": "DDR4",
+      "disk_bays": "8",
+      "disk_desc": "4×1.92T NVMe",
+      "nic": "4×25GbE",
+      "power": "2×900W",
+      "rail": "2U导轨",
+      "unit_price_cents": 14200000,
+      "supplier": "厂商询价(示例)",
+      "basis": "示例价，待替换"
+    }
+  ],
+  "parts": [
+    {
+      "id": 4,
+      "version_id": 1,
+      "category": "内存",
+      "spec": "32G DDR4 RDIMM",
+      "price_cents": 120000,
+      "compat_arch": "海光(C86/x86)",
+      "compat_machine": ""
+    },
+    {
+      "id": 5,
+      "version_id": 1,
+      "category": "内存",
+      "spec": "64G DDR4 RDIMM",
+      "price_cents": 230000,
+      "compat_arch": "海光(C86/x86)",
+      "compat_machine": ""
+    },
+    {
+      "id": 6,
+      "version_id": 1,
+      "category": "内存",
+      "spec": "32G DDR4 RDIMM",
+      "price_cents": 125000,
+      "compat_arch": "鲲鹏(ARM)",
+      "compat_machine": ""
+    },
+    {
+      "id": 7,
+      "version_id": 1,
+      "category": "硬盘",
+      "spec": "1.92T NVMe SSD",
+      "price_cents": 90000,
+      "compat_arch": "",
+      "compat_machine": ""
+    },
+    {
+      "id": 8,
+      "version_id": 1,
+      "category": "硬盘",
+      "spec": "3.84T NVMe SSD",
+      "price_cents": 160000,
+      "compat_arch": "",
+      "compat_machine": ""
+    },
+    {
+      "id": 9,
+      "version_id": 1,
+      "category": "网卡",
+      "spec": "25GbE 双口网卡",
+      "price_cents": 45000,
+      "compat_arch": "",
+      "compat_machine": ""
+    },
+    {
+      "id": 10,
+      "version_id": 1,
+      "category": "RAID",
+      "spec": "Broadcom 9560 8i",
+      "price_cents": 60000,
+      "compat_arch": "",
+      "compat_machine": ""
+    }
+  ],
+  "vm_prices": [
+    {
+      "id": 11,
+      "version_id": 1,
+      "res_type": "cpu",
+      "unit": "核",
+      "price_cents": 70000,
+      "basis": "0.07万元/核（综合单价）"
+    },
+    {
+      "id": 12,
+      "version_id": 1,
+      "res_type": "mem",
+      "unit": "GB",
+      "price_cents": 80000,
+      "basis": "0.08万元/G（综合单价）"
+    },
+    {
+      "id": 13,
+      "version_id": 1,
+      "res_type": "storage",
+      "unit": "GB",
+      "price_cents": 2000,
+      "basis": "0.2万元/100G（综合单价）"
+    }
+  ],
+  "vm_flavors": [
+    {
+      "id": 14,
+      "version_id": 1,
+      "name": "通用型 4C8G",
+      "vcpu": 4,
+      "mem_gb": 8,
+      "storage_gb": 100,
+      "note": "轻量应用 / 代理",
+      "is_common": 1
+    },
+    {
+      "id": 15,
+      "version_id": 1,
+      "name": "通用型 4C16G",
+      "vcpu": 4,
+      "mem_gb": 16,
+      "storage_gb": 100,
+      "note": "中间件 / 缓存",
+      "is_common": 1
+    },
+    {
+      "id": 16,
+      "version_id": 1,
+      "name": "通用型 8C16G",
+      "vcpu": 8,
+      "mem_gb": 16,
+      "storage_gb": 200,
+      "note": "应用服务",
+      "is_common": 1
+    },
+    {
+      "id": 17,
+      "version_id": 1,
+      "name": "通用型 8C32G",
+      "vcpu": 8,
+      "mem_gb": 32,
+      "storage_gb": 200,
+      "note": "数据库 / 重负载",
+      "is_common": 1
+    }
+  ],
+  "quotes": [],
+  "apps": [],
+  "cfg": {
+    "phys": [],
+    "vm": [],
+    "archFilter": "全部",
+    "view": "list",
+    "pos": {},
+    "links": [],
+    "selNode": null,
+    "connecting": false
+  },
+  "arch": {
+    "options": {
+      "layout": "layered-purpose",
+      "groupBy": "purpose",
+      "aggregate": true,
+      "inferDependency": true,
+      "breakCycle": true,
+      "stackReplicas": true,
+      "legend": true,
+      "maxNodes": 300,
+      "maxEdges": 800
+    },
+    "model": null,
+    "graph": null,
+    "xml": null,
+    "source": "topo",
+    "updated_at": null
+  },
+  "hwlib": {
+    "rules": null,
+    "combos": [],
+    "selections": [],
+    "imports": [],
+    "purposes": [],
+    "options": {
+      "autoPickSheet": true,
+      "includeOptional": false,
+      "includeFailed": false,
+      "materializeMachines": false,
+      "conflictPolicy": "keep-manual",
+      "stalePolicy": "remove"
+    },
+    "updated_at": null
+  }
+}
