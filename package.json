@@ -1,0 +1,32 @@
+{
+  "name": "xinchuang-quote-tool",
+  "version": "0.3.0",
+  "description": "信创服务器配置报价工具：架构梳理、硬件清单解析与成本测算（原生 JS 前端 + 零依赖 Python 服务）",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huanhui109/xinchuang-quote-tool.git"
+  },
+  "homepage": "https://github.com/huanhui109/xinchuang-quote-tool#readme",
+  "bugs": {
+    "url": "https://github.com/huanhui109/xinchuang-quote-tool/issues"
+  },
+  "keywords": [
+    "xinchuang",
+    "server",
+    "quote",
+    "hcl",
+    "architecture"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "python3 server.py",
+    "start:node": "node server.js",
+    "test": "node tools/test-all.js",
+    "test:backend": "node tools/test-backend.js",
+    "fixtures": "node tools/make-fixtures.js"
+  },
+  "private": false
+}

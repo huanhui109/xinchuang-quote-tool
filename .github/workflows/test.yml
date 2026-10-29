@@ -1,0 +1,58 @@
+name: test
+
+on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} · python ${{ matrix.python }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个系统都覆盖：start.sh 面向 macOS / Linux，start.bat 面向 Windows
+        os: [ubuntu-latest, macos-latest]
+        node: [18, 22]
+        python: ['3.10', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 显示环境
+        run: |
+          node --version
+          python3 --version
+
+      # 一次跑完 11 套：前端语法 / 脱敏守卫 / 硬件清单解析 / 架构图 / 报价链路 /
+      # SPA 冒烟 / 配置台布局 / xlsx 导出 / 融合模型单测 / 后端 API 契约 / 文档一致性
+      # 后端契约套件会真起 server.py 子进程跑 HTTP，需要 python3 在 PATH 上。
+      - name: 跑全量测试
+        env:
+          PYTHON_BIN: python3
+        run: node tools/test-all.js
+
+      # 测试不应把任何东西写进仓库目录（运行时数据一律落到 .gitignore 覆盖的路径）。
+      # 一旦有测试开始往仓库里写文件，这里会立刻失败 —— 这正是数据泄露的入口。
+      - name: 确认测试未污染工作区
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::测试后工作区出现改动，说明有测试写入了仓库目录："
+            git status --porcelain
+            exit 1
+          fi
+          echo "工作区干净 ✓"

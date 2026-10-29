@@ -79,6 +79,16 @@ tools/fixtures/e2e-config.xlsx
 /tmp/
 /screenshots/
 *.log
+*.zip
+*.orig
+*.rej
+
+# ---- Python 测试与覆盖率 ----
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
 
 # ---- 本地运维运行态（PID / 日志，由 start.sh 生成）----
 .run/
