@@ -1,8 +1,15 @@
 # ---- 运行时数据（含用户真实报价/清单导入记录，不可入库）----
 data/store.json
 data/store.json.corrupt-*
+# save_store() 的临时文件名为 store.json.tmp-<pid>（server.py:253），
+# 不以 .tmp 结尾，必须用前缀通配覆盖
+data/*.tmp-*
+data/store.json.bak-*
 data/*.bak
 data/*.tmp
+# 埋点事件与健康度（运行时追加数据，同样不可入库）
+data/events*.jsonl
+data/events.health.json
 
 # ---- Python ----
 __pycache__/
@@ -72,3 +79,6 @@ tools/fixtures/e2e-config.xlsx
 /tmp/
 /screenshots/
 *.log
+
+# ---- 本地运维运行态（PID / 日志，由 start.sh 生成）----
+.run/
