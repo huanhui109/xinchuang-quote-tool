@@ -15,26 +15,24 @@
 
 ## 快速开始
 
+### 一键启动（推荐）
+
+- **Windows**：双击 `start.bat`，自动探测 Python / Node 兜底。
+- **macOS / Linux**：运行 `./start.sh`，默认启动 Python 完整后端环境：
+
 ```bash
-# 方式一（推荐）：双击 start.bat（Windows，自动探测 Python / Node 兜底）
-# 方式二：命令行
-python server.py          # 需要 Python 3.10+（或 python3 server.py）
-# 方式三：无 Python 时，用 Node 兜底（仅静态，无 REST API）
-node server.js            # 需要 Node.js 18+
-# 然后浏览器打开：
-http://localhost:8000
+./start.sh                 # 启动 Python 完整环境（默认）
+./start.sh start node      # 启动 Node 纯静态兜底环境
+./start.sh start all       # Python + Node 同时启动（各自占用不同端口）
+./start.sh status          # 查看运行状态与访问地址
+./start.sh stop            # 停止全部
 ```
 
-零第三方依赖，无需 `pip install` / `npm install`。
-
-## 快速开始
+### 命令行手动启动
 
 ```bash
-# 方式一（推荐）：双击 start.bat（Windows，自动探测 Python / Node 兜底）
-# 方式二：命令行
 python server.py          # 需要 Python 3.10+（或 python3 server.py）
-# 方式三：无 Python 时，用 Node 兜底（仅静态，无 REST API）
-node server.js            # 需要 Node.js 18+
+node server.js            # 需要 Node.js 18+（无 Python 时兜底，仅静态、无 REST API）
 # 然后浏览器打开：
 http://localhost:8000
 ```
@@ -70,6 +68,31 @@ http://localhost:8000
 | POST | `/api/hcl/parse` | 上传 xlsx/csv（内容 base64），返回 `{sheets:[{name,rows}]}` |
 | GET / PUT / DELETE | `/api/hcl/state` | 规格模板沉淀 + 默认已选配置 + 导入记录 |
 
+### 资产侧接口（融合 MVP）
+
+以下接口带角色裁剪：`X-Role: sales|delivery|ops|viewer`（缺省 `sales`）。
+⚠ 这是**自声明角色**（`role_source = self_declared`），只做「口径隔离」不是身份认证。
+
+| 方法 | 路径 | 说明 | 可见角色 |
+|---|---|---|---|
+| GET | `/api/whoami` | 当前角色的能力矩阵 | 全员 |
+| GET | `/api/catalog` | 机型目录（**脱敏**：只给规格，不含价格） | 全员 |
+| GET | `/api/rooms`、`/api/racks` | 机房 / 机柜 | 全员 |
+| POST / PUT / DELETE | `/api/rooms`、`/api/racks` | 机房 / 机柜维护 | sales / delivery / ops |
+| GET | `/api/rack_units`、`/api/rack_units/<rack_id>` | U 位占用账本（每半 U 一行） | 全员 |
+| GET | `/api/devices`、`/api/devices/<id>` | 设备台账（可加 `?scope=runtime` 或 `?scope=plan`） | 全员 |
+| POST / PUT / DELETE | `/api/devices` | 设备台账维护（高度由服务端按机型带出） | sales / delivery / ops |
+| GET | `/api/rackview?rack_id=<id>` | 机柜 U 位视图（占用位 + 三类冲突分列） | 全员 |
+| POST | `/api/space/validate` | 上架可行性预校验（**只读**，不写任何数据） | 全员 |
+| GET | `/api/deliveries`、`/api/deliveries/<id>` | 交付批次 | 全员 |
+| POST | `/api/deliveries` | 报价单 → 交付批次（可 `dry_run` 预演） | sales / delivery |
+| GET | `/api/assets/export` | 资产台账脱敏导出（固定 7 列，无单价 / 税率 / 含税价） | 全员 |
+| GET / POST | `/api/price_feedback` | 采价反馈（本人可见；采价权 ≠ 发布权） | sales / delivery / ops |
+| GET | `/api/asset_changes`、`/api/reconciliations`、`/api/links` | 变更流水 / 对账 / 链路 | 全员 |
+| GET | `/api/events/health` | 埋点健康度（dropped 计数外露） | 全员 |
+| POST | `/api/events` | 埋点上送 | 全员 |
+| GET | `/api/quotes` | 报价单（**viewer 只得含税总价汇总投影**，无条目明细） | sales / viewer |
+
 快速验证（服务已启动时）：
 
 ```bash
@@ -83,6 +106,13 @@ curl -X POST http://localhost:8000/api/machines \
 ```
 
 > 说明：`/api/machines` 等集合接口只返回**当前生效版本**下的数据（`version_id` 过滤），与页面展示一致。
+
+> **角色隔离可当场验证**（服务已启动时）：
+> ```bash
+> curl -i http://localhost:8000/api/quotes -H 'X-Role: ops'          # 403
+> curl -s http://localhost:8000/api/quotes -H 'X-Role: viewer'        # 只有汇总，无 items
+> curl -s http://localhost:8000/api/assets/export -H 'X-Role: ops'   # 7 列，无任何价格字样
+> ```
 
 ## 功能菜单
 
@@ -101,6 +131,26 @@ curl -X POST http://localhost:8000/api/machines \
 - **架构图 · draw.io（当前隐藏）**：由部署组件清单**自动生成分层拓扑图**（用途分组 + 依赖分层 + 副本数聚合），集成开源 **draw.io（diagrams.net）Embed 前端组件**在页面内手工编辑（拖拽 / 增删节点 / 调整连线 / 分组 / 改样式），可保存回后端、导出 `.drawio`，并支持**回解析后再次自动布局**；无外网时自动降级到内置离线编辑器。详见 [docs/ARCH-DIAGRAM.md](docs/ARCH-DIAGRAM.md)。如需启用，将 `web/app.js` 中 `FEATURES.archDiagram` 设为 `true`。
 - **数据导入导出**：单价库 JSON 备份与迁移
 - **系统设置 / 关于**：税率、口径说明、范围边界
+- **资产（融合 MVP）**
+  - **设备台账**：统一设备实例台账 —— SN、机柜 U 位、状态、用途/主备；新增设备只需填「机型 + SN + 机柜 + U 位」，**机型规格（架构/核数/内存/盘位）由服务端按机型带出**，无需二次录型号
+  - **机房 · 机柜**：机房 → 机柜 → U 位空间模型；`rack_units` 为**权威占用账本**（每半 U 一行，`u_index = round(u × 2)`），同柜同一 U 位不可重复占用
+  - **U 位视图**：机柜正视 U 位图，按 **0.5 网格**渲染（半 U 设备不错位半格），占用位**红色标出**，冲突按三类分列展示
+  - **交付批次**：报价单按「物理机」行拆成 N 台设备实例并预分配 U 位，形成待上架批次；支持只预演不落库
+  - **采价反馈**：交付/运维可提交实际采购价（**采价权 ≠ 发布权**），仅本人与售前可见
+  - **导出台账（脱敏）**：固定 7 列（资产编号/型号/SN/机房/机柜/U位/状态），**无单价、无税率、无含税价**，且不提供「显示价格」开关
+
+### 角色与视图边界（融合 MVP）
+
+页面右上角可切换角色，四种视角对应四种可见范围。**菜单级隔离 + 服务端裁剪双重生效** —— 前端隐藏只是体验，接口层仍会拒绝：
+
+| 角色 | 可见范围 | 不可见 |
+|---|---|---|
+| 售前 `sales` | 全部（单价库 / 配置台 / 报价单 / 资产侧） | —— |
+| 交付 `delivery` | 资产侧全部 + 交付批次 + 采价反馈 | 单价库、报价单（服务端 403） |
+| 运维 `ops` | 资产侧全部 + 采价反馈 + 上架预校验 | 单价库、报价单（服务端 403） |
+| 管理层 `viewer` | 报价单**含税总价汇总** + 资产侧只读 | 报价条目明细、单价库、采价反馈 |
+
+> 概览页按角色分叉：售前看「报价口径」仪表盘，其余角色看「物理落位」概览 —— 强行给运维看售前仪表盘只会得到一屏空数据。
 
 ## 计价规则
 
@@ -191,7 +241,8 @@ curl -X POST http://localhost:8000/api/machines \
 server.py            # 启动脚本（Python）：静态服务 + REST API（http.server，零依赖），端口占用自动顺延
 server.js            # 启动脚本（Node 兜底）：仅静态服务，未安装 Python 时使用
 web/index.html       # 前端入口（相对路径引用资源，可直接静态托管）
-web/styles.css       # 样式
+web/styles.css       # 样式（设计令牌 + 组件样式）
+web/ui.js            # 通用 UI 组件层：Toast / Confirm / Modal / Prompt / Tooltip / 空状态 / 表单构建器 / DataTable
 web/app.js           # 前端逻辑（原生 JS SPA；优先后端 API，不可用时回退 localStorage + 浏览器端 xlsx/csv）
 web/arch-graph.js    # 部署架构图引擎：组件派生 / 分层布局 / draw.io XML 生成与回解析（纯函数，可 Node 单测）
 web/arch-diagram.js  # 架构图页面：draw.io embed 集成 + 内置离线编辑器 + 保存/导出/重排
@@ -205,7 +256,7 @@ tools/test-hcl.js    # 硬件清单解析单元测试（合成清单 fixture + �
 tools/test-quote.js  # 报价链路单元测试（算价 / 选配部件 / 模板 / 校验 / 安全 / xlsx 结构 / 配置台布局）
 tools/verify-layout.js  # 配置台布局结构验证：DOM 嵌套关系 + CSS 规则（E-3）
 tools/verify-xlsx.js   # xlsx 导出端到端验证：严格 ZIP 解析 + 边界场景（E-1 / E-2）
-tools/test-docs.js   # 文档一致性检查：README 与 docs 里的每个代码锚点都必须真实存在（D-6）
+tools/verify-syntax.js # 前端脚本语法校验 + index.html 引用完整性 + 单测加载清单一致性
 tools/test-app-smoke.js  # SPA 离线回退全路由冒烟测试
 tools/make-fixtures.js  # 生成脱敏合成 fixture（tools/fixtures/*.json）
 tools/fixtures/*.json    # 脱敏后的合成解析 fixture（宽表式 / 自由文本式各一份）
@@ -220,11 +271,75 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 > node tools/test-all.js
 > ```
 >
-> 一次跑完 7 套（解析 / 架构图 / 报价链路 / SPA 冒烟 / 布局 / xlsx 导出 / 文档一致性），
+> 一次跑完 8 套（前端语法 / 解析 / 架构图 / 报价链路 / SPA 冒烟 / 布局 / xlsx 导出 / 文档一致性），
 > 任一失败即以非 0 退出码结束。
 >
 > `test-docs.js` 发现「文档写了但代码没有」会**以非 0 退出码失败**，可直接接入 CI，
 > 保证文档持续可作为验收依据。
+
+## 界面与交互体系
+
+前端交互遵循一套统一的组件规范（`web/ui.js`），避免各页面各写一套导致体验割裂。
+
+### 视图契约
+
+每个路由在 `VIEW_META` 中声明三件事，渲染时统一落到顶栏：
+
+| 声明 | 作用 | 示例 |
+|---|---|---|
+| `title` | 顶栏主标题，回答「我在哪」 | `配置台（攒机）` |
+| `desc` | 顶栏副标题，回答「这个页面解决什么问题」 | `组合物理机与虚拟机，实时算价并校验架构一致性` |
+| `actions()` | 顶栏右侧动作区，回答「此刻能做什么」 | `方案对比` / `导出配置清单` / `保存为报价单` |
+
+> 页面级操作只出现在顶栏动作区，区块级操作（架构筛选、视图切换）留在区块内部，
+> 两者不重复——避免同一个按钮在一屏里出现两次。
+
+### 反馈组件
+
+| 组件 | 用途 | 说明 |
+|---|---|---|
+| `UI.toast(msg, kind)` | 轻提示 | `kind` 分 `ok` / `err` / `warn` 三级语义，**成功与失败在视觉上必须能一眼区分**；允许多条堆叠，连续操作不互相覆盖 |
+| `UI.confirm(msg, opts)` | 二次确认 | 替代原生 `confirm()`：可定制标题、按钮文案、危险态配色；支持 Esc 关闭 |
+| `UI.prompt(msg, opts)` | 单值输入 | 替代原生 `prompt()`：可带默认值、占位符与校验 |
+| `UI.modal({...})` | 弹窗 | 统一 head / body / foot 结构，支持 `lg` / `xl` 尺寸与焦点管理 |
+| `UI.tip.showNear()` | 悬浮提示 | **锚点定位**（跟随鼠标会盖住相邻单元格，密集表格里不可用） |
+| `UI.empty(icon, text, hint, action)` | 空状态 | 必须是「图标 + 说明 + 下一步引导」，不能只写「暂无」 |
+| `UI.buildForm(fields)` | 表单构建器 | 字段声明一处，取值与校验统一（`getValues()` / `validate()`） |
+| `DataTable` | 数据表 | 统一「搜索 + 筛选 + 计数 + 图标化空状态」 |
+
+> **渐进增强**：离线单测环境（`tools/test-*.js`）用极简 DOM 桩，没有弹窗宿主。
+> 组件层会检测能力，必要时回退到原生 `confirm` / `prompt`，
+> 既保住自动化测试的同步断言契约，又不影响真实浏览器的体验。
+
+### 概览页（仪表盘）
+
+概览页不是「几个数字 + 一段话」，而是回答四个问题：
+
+1. **现在什么状态** —— 4 张可点击指标卡（配置台行数 / 当前含税总价 / 单价库规模 / 待询价机型），点击直接钻取到相关视图；
+2. **有什么风险** —— 「待办与风险」区把**会影响报价准确性**的事项显式列出并分级（待询价机型、虚拟机单价缺失、架构不一致、规格校验未通过），点击直达处理页面；
+3. **最近做了什么** —— 最近报价单列表（可点进详情）；
+4. **下一步做什么** —— 单价库构成 + 工作流入口。
+
+> 待询价机型（`unit_price_cents = 0`）必须在概览页显式提示：它与「真实 0 元」
+> 在数据上无法区分，漏掉必然导致报价失真。
+
+### 设计令牌
+
+`web/styles.css` 顶部定义语义化令牌，命名按**用途**而非颜色外观：
+
+```
+--text-1/2/3   文本三级（主 / 次 / 弱）
+--line/--line-2/--line-soft   描边三级
+--brand/--brand-d/--brand-soft   品牌色
+--ok/--warn/--danger + 各自的 -soft / -line 变体
+--sp-1..6   间距节奏      --radius/--radius-sm/--radius-lg   圆角
+--ease/--dur   动效
+```
+
+图标统一使用 inline SVG（`Icons` 对象），不使用 emoji——emoji 在不同系统/字体下
+渲染差异大，且与页面内其它 SVG 图标风格割裂。
+
+
 
 ## 硬件清单解析（配置台 → 硬件清单解析）
 
@@ -257,13 +372,53 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 
 前端无第三方运行时依赖：xlsx 读写、CSV 导出、ZIP 打包、架构图布局均为自研实现（`web/xlsx-read.js`、`web/app.js`、`web/arch-graph.js`）。
 
+## 本地启动与运维（start.sh）
+
+项目提供两种运行环境，由 `start.sh`（Mac / Linux）统一管理：
+
+| 环境 | 启动文件 | 能力 |
+|---|---|---|
+| `python` | `server.py` | 静态服务 + REST API + JSON 持久化（`data/store.json`），完整功能 |
+| `node` | `server.js` | 纯静态托管，无 API，前端自动回退浏览器 localStorage |
+
+> 双环境适用于：完整后端（多标签共享、跨会话持久化）与纯静态兜底（静态预览面板、离线、无 Python 环境）分别验证。
+
+命令一览（环境可选 `python` / `node` / `all`，默认 `python` / `all`）：
+
+```bash
+./start.sh                 # 启动 python 完整环境
+./start.sh start node      # 启动 node 纯静态兜底环境
+./start.sh start all       # 两个环境一起启动（端口自动错开）
+./start.sh stop            # 停止所有环境
+./start.sh stop node       # 仅停止 node 环境
+./start.sh restart         # 重启所有
+./start.sh status          # 查看两环境状态、pid、访问地址
+./start.sh logs            # 查看 python 日志（可跟 node）
+./start.sh help            # 帮助
+```
+
+运维细节：
+- 运行态产物（PID 文件、日志）统一放在 `.run/`，已被 `.gitignore` 忽略；
+- 默认端口 `8000`，若被占用脚本自动顺延到下一个空闲端口，并在 `status` / 启动输出中给出实际地址；
+- 停止采用「优雅 `SIGTERM` → 超时 `SIGKILL`」策略，避免数据文件（`store.json`）写一半被截断；
+
 ## 测试
 
 ```bash
 node tools/test-all.js
 ```
 
-一次跑完 7 套（解析 / 架构图 / 报价链路 / SPA 冒烟 / 布局 / xlsx 导出 / 文档一致性），任一失败即以非 0 退出码结束，可直接接入 CI。
+一次跑完 10 套（前端语法/引用 / 硬件清单解析 / 架构图 / 报价链路 / SPA 冒烟 / 配置台布局 / xlsx 导出 / **融合模型单测** / **后端 API 契约** / 文档一致性），任一失败即以非 0 退出码结束，可直接接入 CI。
+
+其中两套是本轮新增、也是本项目此前最大的质量盲区补齐：
+
+- `tools/test-backend.py`（经 `tools/test-backend.js` 包装）：**真起 `server.py` 子进程跑 HTTP**。此前 `server.py` 从未被真正执行过 —— 逻辑写错、接口 404、403 规则没生效，测试都能全绿。用 `STORE_DATA_DIR` 隔离数据目录，绝不污染真实的 `data/store.json`。
+- `tools/test-fusion.js`：融合模型单测（角色裁剪、锚点字段、资产侧路由渲染、离线不白屏）。
+
+```bash
+python3 tools/test-backend.py   # 也可单独跑
+node tools/test-fusion.js
+```
 
 ## 许可证
 
