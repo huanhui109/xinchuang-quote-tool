@@ -14,7 +14,6 @@ import re
 import csv as _csv
 import json
 import shutil
-import socket
 import base64
 import zipfile
 import io
@@ -26,6 +25,21 @@ from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(BASE_DIR, "web")
+
+# ---- 版本号单一来源 ----
+# VERSION 文件是唯一真源；前端离线回退时无法读文件，由 web/app.js 的 APP_VERSION 常量兜底，
+# 两者一致性由 tools/test-docs.js 断言钉死。
+def _read_version():
+    try:
+        with open(os.path.join(BASE_DIR, "VERSION"), "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            return v or "0.0.0"
+    except OSError:
+        return "0.0.0"
+
+
+APP_VERSION = _read_version()
+
 # 数据目录可用 STORE_DATA_DIR 覆盖（测试隔离用；不设置时行为与原来完全一致）
 DATA_DIR = os.environ.get("STORE_DATA_DIR") or os.path.join(BASE_DIR, "data")
 STORE_FILE = os.path.join(DATA_DIR, "store.json")
@@ -1605,7 +1619,7 @@ def seg_id(seg, idx=1):
 def dispatch(method, seg, body, role=DEFAULT_ROLE):
     head = seg[0] if seg else ""
     if method == "GET" and head == "info":
-        return {"name": "信创服务器配置报价工具", "version": "0.2"}
+        return {"name": "信创服务器配置报价工具", "version": APP_VERSION}
     if head == "settings":
         if method == "GET":
             st = dict(STORE.get("settings", {}))

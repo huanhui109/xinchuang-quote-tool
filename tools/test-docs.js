@@ -15,7 +15,7 @@ const ROOT = path.join(__dirname, '..');
 const CODE_FILES = ['web/app.js', 'web/ui.js', 'web/hcl-core.js', 'web/hcl-view.js', 'web/hcl-bridge.js',
   'web/arch-graph.js', 'web/arch-diagram.js', 'web/xlsx-read.js', 'web/styles.css', 'server.py',
   'tools/test-quote.js', 'tools/test-hcl.js', 'tools/test-arch.js',
-  'tools/verify-layout.js', 'tools/verify-xlsx.js', 'tools/verify-syntax.js',
+  'tools/verify-layout.js', 'tools/verify-xlsx.js', 'tools/verify-syntax.js', 'tools/verify-sanitize.js',
   'tools/test-fusion.js', 'tools/test-backend.js', 'tools/test-backend.py', 'tools/test-all.js'];
 
 function readCode() {
@@ -144,6 +144,7 @@ const ANCHORS = [
   { kind: 'feature', doc: '视图契约', code: 'VIEW_META' },
   { kind: 'feature', doc: '空状态', code: 'empty-state' },
   { kind: 'feature', doc: '前端语法', code: 'verify-syntax' },
+  { kind: 'feature', doc: '脱敏守卫', code: 'verify-sanitize' },
 ];
 
 /** 反向检查：代码里的公开开关是否在文档里被说明 */
@@ -232,6 +233,58 @@ function isErrorColumn(docs, index) {
   return cells.some(isBanListCell);
 }
 
+/**
+ * 版本号一致性守卫
+ *
+ * 背景：版本号曾硬编码在 server.py 与 web/app.js 两处，靠人工同步，极易漏改。
+ * 现改为「VERSION 文件为唯一真源 + 前端常量兜底」，但前端是原生 JS（无打包器），
+ * 无法 require 文件，故仍需一个常量 —— 一致性必须由测试钉死，否则又是一处隐性分叉。
+ *
+ * 本守卫同时校验五方：VERSION 文件 / server.py / web/app.js / README / CHANGELOG。
+ */
+function checkVersionConsistency(problems) {
+  const vPath = path.join(ROOT, 'VERSION');
+  if (!fs.existsSync(vPath)) {
+    problems.push('✗ 缺少 VERSION 文件 —— 版本号单一来源缺失');
+    return;
+  }
+  const v = fs.readFileSync(vPath, 'utf8').trim();
+  if (!/^\d+\.\d+\.\d+$/.test(v)) {
+    problems.push(`✗ VERSION 内容不是合法语义化版本：「${v}」`);
+  }
+
+  const py = fs.readFileSync(path.join(ROOT, 'server.py'), 'utf8');
+  if (py.indexOf('APP_VERSION = _read_version()') < 0) {
+    problems.push('✗ server.py 未从 VERSION 文件读取版本号（应为 APP_VERSION = _read_version()）');
+  }
+  if (py.indexOf('"version": APP_VERSION') < 0) {
+    problems.push('✗ server.py 的 /api/info 未返回 APP_VERSION');
+  }
+
+  const app = fs.readFileSync(path.join(ROOT, 'web/app.js'), 'utf8');
+  const m = app.match(/const APP_VERSION\s*=\s*['"]([^'"]+)['"]/);
+  if (!m) {
+    problems.push('✗ web/app.js 缺少 APP_VERSION 常量');
+  } else if (m[1] !== v) {
+    problems.push(`✗ 版本号不一致：VERSION 文件为「${v}」，web/app.js 的 APP_VERSION 为「${m[1]}」`);
+  }
+
+  // 版本徽标必须在 README **首部**声明（标题下方的版本行）。
+  // 若只做全文子串匹配，正文里任意一句「v0.3.0 新增」都会让它通过 —— 那是假安全。
+  const rdLines = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').split('\n').slice(0, 10);
+  const head = rdLines.join('\n');
+  if (head.indexOf('v' + v) < 0) {
+    problems.push(`✗ README 首部未以版本徽标形式声明当前版本「v${v}」`);
+  }
+
+  const clPath = path.join(ROOT, 'CHANGELOG.md');
+  if (!fs.existsSync(clPath)) {
+    problems.push('✗ 缺少 CHANGELOG.md');
+  } else if (fs.readFileSync(clPath, 'utf8').indexOf('[' + v + ']') < 0) {
+    problems.push(`✗ CHANGELOG.md 缺少版本「${v}」的条目`);
+  }
+}
+
 function main() {
   const code = readCode();
   const docs = readDocs();
@@ -285,6 +338,10 @@ function main() {
   if (hasAuditDLCR && !hasGuard) {
     problems.push('✗ 文档在 MVP 语境考核 DLCR，但没有降级口径说明 —— ③④ 在二期，MVP 期分子恒为 0');
   }
+
+  // ---- 版本号一致性（VERSION 单一来源）----
+  checked++;
+  checkVersionConsistency(problems);
 
   console.log('============================================================');
   console.log('文档一致性检查（D-6）');
