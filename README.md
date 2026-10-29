@@ -1,8 +1,43 @@
 # 信创服务器配置报价工具
 
+**当前版本 v0.3.0** · [MIT 许可证](LICENSE) · [变更日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+
 面向 IT 基础架构人员，对**海光 / 鲲鹏**信创服务器（x86 / ARM）进行架构梳理，并对物理机与虚拟机的不同配置、不同数量做价格成本测算；支持配置组合、实时算价、保存与导出配置单 / 报价单。
 
 > 计价口径：虚拟机单价含许可与运维、不做阶梯折扣、虚拟机不折算宿主机、不计维保、物理机按架构分库。
+
+## 项目简介
+
+### 解决什么问题
+
+信创服务器采购里，**报价**与**落位**是两条互相割裂的线：
+
+- **售前**在配置台里攒机型、算总价、导报价单 —— 但算完之后，机型规格、U 位占用、实际采购价散落在各人的表格里；
+- **交付 / 运维**拿到的是一份「14 台 Hygon 5480」的清单，却不知道每台该放哪个机柜的哪个 U 位，也不知道哪台还没采购、哪台已上架；
+- **管理层**想看全局投入与资产分布，拿到的却是一份含明细成本的报价单。
+
+本工具把这条链路接起来：
+
+```
+单价库 → 配置台 → 报价单 → 交付批次 → 设备台账 → 机柜 U 位视图 → 上架预校验
+```
+
+### 为谁而做
+
+| 角色 | 能拿到什么 | 用它解决什么 |
+|---|---|---|
+| 售前 `sales` | 全量（单价库 / 配置台 / 报价单 / 资产侧） | 快速出具可信报价，避免手工算价漏项 |
+| 交付 `delivery` | 资产侧全量 + 交付批次 + 采价反馈 | 把报价单拆成可上架的设备批次与 U 位预分配 |
+| 运维 `ops` | 资产侧全量 + 采价反馈 + 上架预校验 | 核对物理落位，提前发现 U 位冲突与容量缺口 |
+| 管理层 `viewer` | 报价单**含税总价汇总** + 资产侧只读 | 看投入与资产分布，不接触明细成本 |
+
+> 角色是**请求头自声明**的（`X-Role`），只做「口径隔离」不是身份认证 —— 详见 [安全说明](SECURITY.md)。
+
+### 技术形态
+
+- **前端**：原生 JS SPA（无构建、无打包器、零第三方运行时依赖）。xlsx 读写、CSV 导出、ZIP 打包、架构图布局全部自研。
+- **后端**：Python 3.10+ **标准库**（`http.server`），同时提供静态服务与 REST API，JSON 文件持久化，**无数据库**。
+- **双环境兜底**：后端不可用时前端自动回退浏览器 localStorage，功能依然完整；未安装 Python 时可用 Node 纯静态兜底。
 
 ## 开源说明
 
@@ -11,7 +46,7 @@
 - 代码、文档、测试 fixture 均已移除真实客户名称、内部系统代号、内部文档库链接、真实商务条款与本地绝对路径。
 - 测试用 fixture（`tools/fixtures/*.json`）为**结构等价的合成数据**，由 `node tools/make-fixtures.js` 生成，可复现。
 - `data/store.json` 属于运行时用户数据（含真实报价与导入记录），**已加入 `.gitignore`、不随仓库分发**；仓库内提供 `data/store.example.json` 作为干净示例。
-- 内置单价均为**示例价**（`unit_price_cents` 多数为 0，标记「待询价」），请按实际询价结果替换后再用于正式报价。
+- 内置单价均为**示例价**（`basis` 字段标记「示例价，待替换」），**不代表任何厂商的真实报价**；请按实际询价结果替换后再用于正式报价。单价为 `0` 的机型才表示「待询价」，二者是不同状态。
 
 ## 快速开始
 
@@ -68,7 +103,7 @@ http://localhost:8000
 | POST | `/api/hcl/parse` | 上传 xlsx/csv（内容 base64），返回 `{sheets:[{name,rows}]}` |
 | GET / PUT / DELETE | `/api/hcl/state` | 规格模板沉淀 + 默认已选配置 + 导入记录 |
 
-### 资产侧接口（融合 MVP）
+### 资产侧接口
 
 以下接口带角色裁剪：`X-Role: sales|delivery|ops|viewer`（缺省 `sales`）。
 ⚠ 这是**自声明角色**（`role_source = self_declared`），只做「口径隔离」不是身份认证。
@@ -131,7 +166,7 @@ curl -X POST http://localhost:8000/api/machines \
 - **架构图 · draw.io（当前隐藏）**：由部署组件清单**自动生成分层拓扑图**（用途分组 + 依赖分层 + 副本数聚合），集成开源 **draw.io（diagrams.net）Embed 前端组件**在页面内手工编辑（拖拽 / 增删节点 / 调整连线 / 分组 / 改样式），可保存回后端、导出 `.drawio`，并支持**回解析后再次自动布局**；无外网时自动降级到内置离线编辑器。详见 [docs/ARCH-DIAGRAM.md](docs/ARCH-DIAGRAM.md)。如需启用，将 `web/app.js` 中 `FEATURES.archDiagram` 设为 `true`。
 - **数据导入导出**：单价库 JSON 备份与迁移
 - **系统设置 / 关于**：税率、口径说明、范围边界
-- **资产（融合 MVP）**
+- **资产侧能力**
   - **设备台账**：统一设备实例台账 —— SN、机柜 U 位、状态、用途/主备；新增设备只需填「机型 + SN + 机柜 + U 位」，**机型规格（架构/核数/内存/盘位）由服务端按机型带出**，无需二次录型号
   - **机房 · 机柜**：机房 → 机柜 → U 位空间模型；`rack_units` 为**权威占用账本**（每半 U 一行，`u_index = round(u × 2)`），同柜同一 U 位不可重复占用
   - **U 位视图**：机柜正视 U 位图，按 **0.5 网格**渲染（半 U 设备不错位半格），占用位**红色标出**，冲突按三类分列展示
@@ -139,7 +174,7 @@ curl -X POST http://localhost:8000/api/machines \
   - **采价反馈**：交付/运维可提交实际采购价（**采价权 ≠ 发布权**），仅本人与售前可见
   - **导出台账（脱敏）**：固定 7 列（资产编号/型号/SN/机房/机柜/U位/状态），**无单价、无税率、无含税价**，且不提供「显示价格」开关
 
-### 角色与视图边界（融合 MVP）
+### 角色与视图边界
 
 页面右上角可切换角色，四种视角对应四种可见范围。**菜单级隔离 + 服务端裁剪双重生效** —— 前端隐藏只是体验，接口层仍会拒绝：
 
@@ -238,6 +273,7 @@ curl -X POST http://localhost:8000/api/machines \
 ## 目录结构
 
 ```
+VERSION              # 版本号单一来源（纯文本单行，如 0.3.0）
 server.py            # 启动脚本（Python）：静态服务 + REST API（http.server，零依赖），端口占用自动顺延
 server.js            # 启动脚本（Node 兜底）：仅静态服务，未安装 Python 时使用
 web/index.html       # 前端入口（相对路径引用资源，可直接静态托管）
@@ -251,18 +287,29 @@ web/xlsx-read.js     # 浏览器端 xlsx/csv 读取（后端不可用时的兜�
 web/hcl-view.js      # 硬件清单解析页面：上传 / 纠偏 / 明细校对 / 模板沉淀 / 默认已选配置 / 应用
 docs/ARCH-DIAGRAM.md # 架构图模块说明（数据格式、配置项、边界情况）
 docs/HW-CONFIG-PARSER.md # 硬件清单解析模块说明（数据结构、配置项、边界情况）
-tools/test-arch.js   # 架构图单元测试（布局算法 / XML 往返 / 视图冒烟）
+tools/test-all.js    # 统一测试入口：一次跑完 11 套，任一失败即以非 0 退出码结束
 tools/test-hcl.js    # 硬件清单解析单元测试（合成清单 fixture + 边界场景）
+tools/test-arch.js   # 架构图单元测试（布局算法 / XML 往返 / 视图冒烟）
 tools/test-quote.js  # 报价链路单元测试（算价 / 选配部件 / 模板 / 校验 / 安全 / xlsx 结构 / 配置台布局）
+tools/test-app-smoke.js  # SPA 离线回退全路由冒烟测试
+tools/test-fusion.js # 融合模型单测（角色裁剪 / 锚点字段 / 资产侧路由渲染 / 离线不白屏）
+tools/test-backend.py # 后端 API 契约测试（真起 server.py 子进程跑 HTTP）
+tools/test-backend.js # 上述 Python 套件的 Node 包装器（精确解析通过 / 失败数）
 tools/verify-layout.js  # 配置台布局结构验证：DOM 嵌套关系 + CSS 规则（E-3）
 tools/verify-xlsx.js   # xlsx 导出端到端验证：严格 ZIP 解析 + 边界场景（E-1 / E-2）
 tools/verify-syntax.js # 前端脚本语法校验 + index.html 引用完整性 + 单测加载清单一致性
-tools/test-app-smoke.js  # SPA 离线回退全路由冒烟测试
+tools/verify-sanitize.js # 脱敏守卫：防止敏感内容被重新引入仓库
 tools/make-fixtures.js  # 生成脱敏合成 fixture（tools/fixtures/*.json）
 tools/fixtures/*.json    # 脱敏后的合成解析 fixture（宽表式 / 自由文本式各一份）
 data/store.json      # 运行时数据（已 gitignore）：首次启动自动生成示例数据；删除即恢复默认示例
-data/store.example.json  # 干净的示例数据（等价于内置 seed_store() 的输出）
+data/store.example.json  # 干净的示例数据（与内置 seed_store() 同源，个别措辞略有差异）
+start.sh             # macOS / Linux 一键启动与运维（start / stop / restart / status / logs）
 start.bat            # Windows 一键启动（自动探测 python → python3 → node 兜底）
+CHANGELOG.md         # 变更日志（Keep a Changelog 格式）
+CONTRIBUTING.md      # 贡献指南（开发环境 / 测试要求 / 提交规范 / 脱敏红线）
+SECURITY.md          # 安全说明（含 X-Role 自声明头的信任边界）
+.env.example         # 环境变量样例（16 项，全部带默认值与说明）
+.github/workflows/test.yml # CI：Node + Python 矩阵，跑 node tools/test-all.js
 ```
 
 > 全量自测（建议提交前跑一遍）：
@@ -271,7 +318,7 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 > node tools/test-all.js
 > ```
 >
-> 一次跑完 8 套（前端语法 / 解析 / 架构图 / 报价链路 / SPA 冒烟 / 布局 / xlsx 导出 / 文档一致性），
+> 一次跑完 11 套（前端语法 / 脱敏守卫 / 硬件清单解析 / 架构图 / 报价链路 / SPA 冒烟 / 配置台布局 / xlsx 导出 / 融合模型单测 / 后端 API 契约 / 文档一致性），
 > 任一失败即以非 0 退出码结束。
 >
 > `test-docs.js` 发现「文档写了但代码没有」会**以非 0 退出码失败**，可直接接入 CI，
@@ -356,11 +403,14 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 > 数据说明：删除 `data/store.json` 后重启服务，会重新生成内置示例数据（海光 5480/7470、鲲鹏 920 等）。
 > 页面使用**相对路径**引用 `styles.css` / `app.js`，因此可将 `web/` 目录直接交给任意静态服务器托管；
 > 但此时无后端，`app.js` 会自动回退 localStorage 模式（功能完整，仅数据存于当前浏览器）。
-> 若 静态预览面板无法加载（静态快照不执行脚本），请用 `python server.py` 打开 `http://localhost:8000`。
+> 若静态预览面板无法加载（静态快照不执行脚本），请用 `python server.py` 打开 `http://localhost:8000`。
 
 ## 已知边界（本期不做）
 
-阶梯折扣、宿主机超分/预留/HA 折算、维保计算、在线支付、多供应商招投标、角色权限（单机自用，成本价防泄为后续迭代项）。
+阶梯折扣、宿主机超分/预留/HA 折算、维保计算、在线支付、多供应商招投标。
+
+> 成本价防泄已通过「角色隔离 + 服务端价格字段投影 + 脱敏导出」实现（见[角色与视图边界](#角色与视图边界)）。
+> 但角色是**请求头自声明**，只做口径隔离、不构成身份认证 —— 需要真正的权限体系请在网关层接入 SSO 后把角色写入签名令牌。
 
 ## 依赖
 
@@ -371,6 +421,31 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 | 浏览器 | 支持 ES2020 的现代浏览器 | 前端为原生 JS SPA，无构建步骤、无打包器 |
 
 前端无第三方运行时依赖：xlsx 读写、CSV 导出、ZIP 打包、架构图布局均为自研实现（`web/xlsx-read.js`、`web/app.js`、`web/arch-graph.js`）。
+
+## 配置项
+
+全部通过**环境变量**配置，无配置文件依赖；样例见 [`.env.example`](.env.example)。未设置时使用下表默认值。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `HOST` | `127.0.0.1` | 监听地址。默认仅本机可访问；确需对外暴露再设为 `0.0.0.0` |
+| `PORT` | `8000` | 监听端口。被占用时服务自动顺延到 8001、8002… 并在启动日志提示 |
+| `STORE_DATA_DIR` | `<项目根>/data` | 数据目录（`store.json`、备份、埋点事件文件）。测试可用它做隔离 |
+| `MAX_BODY_BYTES` | `33554432`（32MB） | REST 请求体上限，防止超大 JSON 打满内存 |
+| `EVENTS_MAX_BYTES` | `10485760`（10MB） | 埋点事件文件单文件体积上限，超出自动轮转 |
+| `EVENTS_KEEP` | `10` | 埋点事件文件保留份数 |
+| `DRAWIO_EMBED_URL` | `https://embed.diagrams.net/` | 架构图编辑器地址。内网/离线可指向自建 drawio 静态服务 |
+| `DRAWIO_LOAD_TIMEOUT_MS` | `12000` | draw.io 加载超时（毫秒），超时自动降级到内置离线编辑器 |
+| `MAX_ARCH_XML_BYTES` | `8388608`（8MB） | 架构图 XML 体积上限 |
+| `HCL_MAX_UPLOAD_BYTES` | `8388608`（8MB） | 硬件清单单次上传体积上限 |
+| `HCL_MAX_ROWS` | `5000` | 单表读取行数上限（超出截断并告警） |
+| `HCL_MAX_COLS` | `60` | 单表读取列数上限 |
+| `HCL_MAX_SHEETS` | `8` | 单文件工作表数量上限 |
+| `HCL_MAX_UNZIP_BYTES` | `33554432`（32MB） | 解压预算（解压炸弹防护） |
+| `HCL_MAX_ZIP_ENTRIES` | `200` | zip 条目数上限 |
+| `HCL_MAX_STATE_BYTES` | `4194304`（4MB） | 规格模板 + 已选配置状态上限 |
+
+> `server.js`（Node 兜底）只读取 `HOST` 与 `PORT` 两项，其余配置仅 Python 后端生效。
 
 ## 本地启动与运维（start.sh）
 
@@ -400,7 +475,9 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 运维细节：
 - 运行态产物（PID 文件、日志）统一放在 `.run/`，已被 `.gitignore` 忽略；
 - 默认端口 `8000`，若被占用脚本自动顺延到下一个空闲端口，并在 `status` / 启动输出中给出实际地址；
-- 停止采用「优雅 `SIGTERM` → 超时 `SIGKILL`」策略，避免数据文件（`store.json`）写一半被截断；
+- 停止采用「优雅 `SIGTERM` → 超时 `SIGKILL`」策略，避免数据文件（`store.json`）写一半被截断。
+
+> 依赖 `lsof`（macOS / Linux 自带）做端口占用探测；Windows 请用 `start.bat`。若系统无 `lsof`，脚本会退化为逐端口绑定探测。
 
 ## 测试
 
@@ -408,9 +485,9 @@ start.bat            # Windows 一键启动（自动探测 python → python3 �
 node tools/test-all.js
 ```
 
-一次跑完 10 套（前端语法/引用 / 硬件清单解析 / 架构图 / 报价链路 / SPA 冒烟 / 配置台布局 / xlsx 导出 / **融合模型单测** / **后端 API 契约** / 文档一致性），任一失败即以非 0 退出码结束，可直接接入 CI。
+一次跑完 11 套（前端语法/引用 / **脱敏守卫** / 硬件清单解析 / 架构图 / 报价链路 / SPA 冒烟 / 配置台布局 / xlsx 导出 / **融合模型单测** / **后端 API 契约** / 文档一致性），任一失败即以非 0 退出码结束，可直接接入 CI。
 
-其中两套是本轮新增、也是本项目此前最大的质量盲区补齐：
+其中两套是 v0.3.0 新增、也是本项目此前最大的质量盲区补齐：
 
 - `tools/test-backend.py`（经 `tools/test-backend.js` 包装）：**真起 `server.py` 子进程跑 HTTP**。此前 `server.py` 从未被真正执行过 —— 逻辑写错、接口 404、403 规则没生效，测试都能全绿。用 `STORE_DATA_DIR` 隔离数据目录，绝不污染真实的 `data/store.json`。
 - `tools/test-fusion.js`：融合模型单测（角色裁剪、锚点字段、资产侧路由渲染、离线不白屏）。
@@ -423,6 +500,8 @@ node tools/test-fusion.js
 ## 许可证
 
 [MIT](LICENSE) © huanhui109
+
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 免责声明
 

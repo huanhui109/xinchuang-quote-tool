@@ -8,6 +8,7 @@ const path = require('path');
 
 const SUITES = [
   ['verify-syntax.js', '前端语法 / 引用'],
+  ['verify-sanitize.js', '脱敏守卫'],
   ['test-hcl.js', '硬件清单解析'],
   ['test-arch.js', '架构图'],
   ['test-quote.js', '报价链路 / 配置台'],

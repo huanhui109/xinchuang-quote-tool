@@ -1,5 +1,8 @@
 /* 信创服务器配置报价工具 - 前端（原生 JS，无第三方依赖，浏览器本地运行） */
 'use strict';
+// 版本号：VERSION 文件是唯一真源；前端无打包器、无法 require 文件，
+// 故此处为离线回退兜底常量，与 server.py 的 APP_VERSION 一致性由 tools/test-docs.js 断言。
+const APP_VERSION = '0.3.0';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -270,7 +273,7 @@ const localApi = async (method, path, body) => {
   const table = (t) => { STORE[t] = STORE[t] || []; return STORE[t]; };
   const ver = (t) => { const v = active(); return table(t).filter(r => r.version_id === v.id); };
 
-  if (method === 'GET' && head === 'info') return { name: '信创服务器配置报价工具', version: '0.2' };
+  if (method === 'GET' && head === 'info') return { name: '信创服务器配置报价工具', version: APP_VERSION };
   // ---- 角色自述（M5）----
   if (method === 'GET' && head === 'whoami') {
     return { role: currentRole(), role_source: ROLE_SOURCE };
@@ -3534,7 +3537,7 @@ async function viewSettings() {
     <div class="actions"><button class="btn primary" onclick="saveSettings()">保存设置</button></div>
   </div>
   <div class="card card-pad" style="margin-top:16px;max-width:760px">
-    <h2 class="h2">已确认口径（需求 v0.2）</h2>
+    <h2 class="h2">已确认口径（计价规则）</h2>
     <ol class="hint">
       <li>虚拟机单价 = 综合单价（已含许可与运维），不拆分；虚拟机不分架构、不折算宿主机。</li>
       <li>本期不做阶梯折扣，报价为纯线性 单价×数量。</li>
@@ -3559,7 +3562,7 @@ function viewAbout() {
     <h3 style="margin-top:14px">范围与边界</h3>
     <p class="hint">本期：单价库（版本化、物理机分架构）、配置组合器（物理机架构校验）、报价引擎（纯线性含税）、导出、架构梳理。不做：阶梯折扣、宿主机超分折算、维保计算、在线支付与多供应商招投标。</p>
     <h3 style="margin-top:14px">已知风险（对应需求文档）</h3>
-    <p class="hint">RK-02 单价版本化（已通过版本管理+报价锁定版本号缓解）；RK-06 成本价防泄（本期单机自用，未做角色权限，后续迭代补）。</p>
+    <p class="hint">单价版本化：已通过版本管理 + 报价锁定版本号实现；成本价防泄：已通过角色隔离与服务端价格字段投影实现（角色为请求头自声明，仅用于口径隔离，<b>不构成身份认证</b>）。</p>
     <h3 style="margin-top:14px">开源与免责声明</h3>
     <p class="hint">本项目为<b>开源项目</b>，其代码、文档及由此生成的任何结果<b>仅供个人学习与技术交流使用</b>，不得用于商业用途。工具内置的单价、配置与报价样例均为<b>示意数据</b>，不代表任何厂商真实报价或承诺；实际采购请以官方询价与合同为准。使用本工具所产生的任何决策与后果均由使用者自行承担，作者不承担任何法律责任。</p>
   </div>`;
