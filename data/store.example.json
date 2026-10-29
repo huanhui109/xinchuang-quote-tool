@@ -31,6 +31,7 @@
       "nic": "4×25GbE",
       "power": "2×800W",
       "rail": "2U导轨",
+      "chassis_u": 0,
       "unit_price_cents": 8600000,
       "supplier": "厂商询价(示例)",
       "basis": "示例价，待替换"
@@ -52,6 +53,7 @@
       "nic": "4×25GbE",
       "power": "2×1200W",
       "rail": "2U导轨",
+      "chassis_u": 0,
       "unit_price_cents": 15800000,
       "supplier": "厂商询价(示例)",
       "basis": "示例价，待替换"
@@ -73,6 +75,7 @@
       "nic": "4×25GbE",
       "power": "2×900W",
       "rail": "2U导轨",
+      "chassis_u": 0,
       "unit_price_cents": 14200000,
       "supplier": "厂商询价(示例)",
       "basis": "示例价，待替换"
@@ -256,5 +259,14 @@
       "stalePolicy": "remove"
     },
     "updated_at": null
-  }
+  },
+  "rooms": [],
+  "racks": [],
+  "rack_units": [],
+  "devices": [],
+  "asset_changes": [],
+  "links": [],
+  "deliveries": [],
+  "reconciliations": [],
+  "price_feedback": []
 }
