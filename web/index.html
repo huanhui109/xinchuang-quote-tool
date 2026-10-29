@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>服务器配置工作台</title>
+  <title>信创服务器配置报价工作台</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
       <div class="brand">
         <div class="brand-logo">信</div>
         <div class="brand-text">
-          <div class="brand-title">服务器配置工作台</div>
+          <div class="brand-title">信创配置报价台</div>
           <div class="brand-sub">配置 · 架构 · 报价</div>
         </div>
       </div>
@@ -22,8 +22,13 @@
 
     <main class="main">
       <header class="topbar">
-        <div class="crumb" id="crumb">概览</div>
+        <div class="topbar-left">
+          <h1 class="crumb" id="pageTitle">概览</h1>
+          <p class="page-desc" id="pageDesc"></p>
+        </div>
         <div class="topbar-right">
+          <div class="topbar-actions" id="topbarActions"></div>
+          <span id="roleBar"></span>
           <span class="ver-pill" id="verPill">单价库版本：—</span>
           <span class="tax-pill" id="taxPill">税率 —</span>
         </div>
@@ -33,15 +38,27 @@
   </div>
 
   <div class="modal-mask" id="modalMask" hidden>
-    <div class="modal" id="modal"></div>
+    <div class="modal" id="modal">
+      <div class="modal-head">
+        <h3>标题</h3>
+        <span class="x" id="mClose" title="关闭">×</span>
+      </div>
+      <div class="modal-body"></div>
+      <div class="modal-foot"></div>
+    </div>
   </div>
-  <div id="toast" class="toast" hidden></div>
+
+  <!-- Toast 容器：允许多条堆叠，连续操作不会互相覆盖 -->
+  <div class="toast-wrap" id="toastWrap"></div>
+  <!-- Tooltip 容器：表格密集场景用锚点定位，避免遮挡相邻单元格 -->
+  <div class="tooltip" id="tooltip"></div>
 
   <script src="arch-graph.js"></script>
   <script src="arch-diagram.js"></script>
   <script src="hcl-core.js"></script>
   <script src="xlsx-read.js"></script>
   <script src="hcl-view.js"></script>
+  <script src="ui.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -56,7 +56,7 @@ global.URL.revokeObjectURL = () => {};
 global.fetch = async () => { throw new Error('offline'); };
 
 const vm = require('vm');
-['arch-graph.js', 'arch-diagram.js', 'hcl-core.js', 'xlsx-read.js', 'hcl-view.js', 'app.js']
+['arch-graph.js', 'arch-diagram.js', 'hcl-core.js', 'xlsx-read.js', 'hcl-view.js', 'ui.js', 'app.js']
   .forEach(f => vm.runInThisContext(fs.readFileSync(path.join('web', f), 'utf8'), { filename: f }));
 
 // ---------- 严格 ZIP 解析器 ----------

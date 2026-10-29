@@ -88,8 +88,13 @@ function pickMachineFor(group) {
 window.applyScheme = async (key) => {
   const tpl = SCHEME_TEMPLATES[key]; if (!tpl) return;
   const hasCfg = CFG.phys.length || CFG.vm.length;
-  if (hasCfg && !confirm(`应用「${tpl.name}」模板将清空当前 ${CFG.phys.length + CFG.vm.length} 行配置，是否继续？`)) return;
+  if (hasCfg && !await UI.confirm(`应用「${tpl.name}」模板将清空当前 ${CFG.phys.length + CFG.vm.length} 行配置，是否继续？`,
+    { title: '应用方案模板', okText: '清空并应用', danger: true })) return;
   await loadLib();
+  // ⚠ 资产侧隔离（M1.0-e）：此处只允许改**规划态** CFG。
+  // 下面这行会清空 CFG.phys / CFG.vm / CFG.pos / CFG.links —— 配置行 id 随之失效，
+  // 因此设备的**持久锚点只能是 source_line_uid（指向报价单条目）**，
+  // 不能用配置行 id 当锚点。运行态的 devices / links / rack_units 一律不得触碰。
   CFG.phys = []; CFG.vm = []; CFG.pos = {}; CFG.links = [];
   const noMachine = [];
   tpl.groups.forEach(g => {
@@ -154,6 +159,8 @@ function seedStore() {
     _seq: 100,
     settings: { tax_rate: '0.13', currency: 'CNY' },
     versions: [], machines: [], parts: [], vm_prices: [], vm_flavors: [], quotes: [], apps: [],
+    // 资产侧（融合 MVP）：设备台账 / 机房·机柜 / U 位行级占用账本 / 设备变更 / 连线 / 交付批次 / 采价反馈
+    assets: { devices: [], rooms: [], racks: [], rack_units: [], asset_changes: [], links: [], deliveries: [], reconciliations: [], price_feedback: [] },
     // 架构图（draw.io）持久化：model=组件清单快照 / graph=自动布局结果 / xml=手工编辑后的图
     arch: { options: Object.assign({}, ARCH_OPTIONS_DEFAULT()), model: null, graph: null, xml: null, source: 'topo', updated_at: null },
     // 硬件配置清单解析：自定义规则 / 沉淀模板 / 默认已选配置 / 导入记录
@@ -205,7 +212,8 @@ function loadStore() {
 const api = async (method, path, body) => {
   let res;
   try {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    // X-Role：角色自声明（M5）。服务端据此裁剪字段与返回 403。
+    const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Role': currentRole() } };
     if (method === 'POST' || method === 'PUT') opts.body = JSON.stringify(body ?? {});
     res = await fetch(path, opts);
   } catch (e) {
@@ -263,15 +271,38 @@ const localApi = async (method, path, body) => {
   const ver = (t) => { const v = active(); return table(t).filter(r => r.version_id === v.id); };
 
   if (method === 'GET' && head === 'info') return { name: '信创服务器配置报价工具', version: '0.2' };
+  // ---- 角色自述（M5）----
+  if (method === 'GET' && head === 'whoami') {
+    return { role: currentRole(), role_source: ROLE_SOURCE };
+  }
+  if (method === 'GET' && head === 'catalog') {
+    // 机型目录（脱敏）：与后端同口径 —— 只给规格，不给任何价格字段
+    const v = active();
+    return table('machines').filter(m => m.version_id === v.id).map(m => ({
+      id: m.id, brand: m.brand, model: m.model, arch: m.arch, rail: m.rail,
+      chassis_u: m.chassis_u ?? 0, cpu_model: m.cpu_model, cpu_cores: m.cpu_cores,
+      mem_capacity: m.mem_capacity, disk_desc: m.disk_desc, nic: m.nic,
+    }));
+  }
   if (head === 'settings') {
-    if (method === 'GET') return Object.assign({}, STORE.settings);
-    if (method === 'POST') { Object.assign(STORE.settings, body); lsSave(); return { ok: true }; }
+    if (method === 'GET') {
+      const st = Object.assign({}, STORE.settings);
+      // 非 sales 剥离 tax_rate：用字段裁剪而非 403，否则 loadLib() 会因 reject 整页白屏
+      if (!roleCan('read_pricing')) delete st.tax_rate;
+      return st;
+    }
+    if (method === 'POST') {
+      if (!roleCan('write_quotes')) denyRole('当前角色无权修改系统设置');
+      Object.assign(STORE.settings, body); lsSave(); return { ok: true };
+    }
   }
   if (head === 'os_options') return OS_OPTIONS;
   if (head === 'hypervisor_options') return HV_OPTIONS;
   if (head === 'versions') {
     if (method === 'GET') return STORE.versions.map(r => ({ ...r }));
     if (method === 'POST') {
+      // 发布权仅 sales（采价权 ≠ 发布权）
+      if (!roleCan('publish_pricing')) denyRole('仅售前角色可新建定价版本');
       const v = active(); const nid = nextId();
       // 克隆当前生效版本的机型/部件/虚拟机
       const newM = table('machines').filter(r => r.version_id === v.id).map(r => ({ ...r, id: nextId(), version_id: nid }));
@@ -286,10 +317,13 @@ const localApi = async (method, path, body) => {
   }
   // 路径 /api/versions/<id>/activate → seg = ['versions', '<id>', 'activate']
   if (method === 'PUT' && seg[2] === 'activate') {
+    if (!roleCan('publish_pricing')) denyRole('仅售前角色可启用定价版本');
     const id = idOf(1); STORE.versions.forEach(x => x.is_active = (x.id === id ? 1 : 0)); lsSave(); return { ok: true };
   }
   for (const t of ['machines', 'parts', 'vm_prices', 'vm_flavors']) {
     if (head === t) {
+      // 单价库对非 sales 角色不可见（菜单级 + 数据级双重隔离）
+      if (!roleCan('read_pricing')) denyRole('当前角色无权访问单价库');
       if (method === 'GET') return ver(t).map(r => ({ ...r }));
       if (method === 'POST') { const d = Object.assign({ id: nextId(), version_id: active().id }, body); table(t).push(d); lsSave(); return { ok: true, id: d.id }; }
       if (method === 'PUT') { const id = idOf(1); const r = table(t).find(x => x.id === id); if (r) Object.assign(r, body, { id }); lsSave(); return { ok: true }; }
@@ -297,10 +331,50 @@ const localApi = async (method, path, body) => {
     }
   }
   if (head === 'quotes') {
-    if (method === 'GET' && seg.length === 1) return STORE.quotes.map(q => ({ id: q.id, name: q.name, created_at: q.created_at, version_id: q.version_id, version_name: q.version_name, tax_rate: q.tax_rate, subtotal_cents: q.subtotal_cents, tax_cents: q.tax_cents, total_cents: q.total_cents, item_count: (q.items || []).length }));
-    if (method === 'POST') { const d = Object.assign({ id: nextId(), created_at: now() }, body); STORE.quotes.push(d); lsSave(); return { ok: true, id: d.id }; }
-    if (method === 'GET' && seg[1]) { const q = STORE.quotes.find(x => x.id === idOf(1)); return q ? { ...q, items: q.items || [] } : {}; }
-    if (method === 'DELETE' && seg[1]) { STORE.quotes = STORE.quotes.filter(x => x.id !== idOf(1)); lsSave(); return { ok: true }; }
+    // 报价单含价格字段，三档处理（与后端同口径）：
+    //   sales          → 全量（含条目明细与金额）
+    //   viewer（管理层）→ 仅汇总投影（不含 items 与明细金额）
+    //   delivery / ops → 403
+    if (!roleCan('read_quotes')) denyRole('当前角色无权访问报价单');
+    // viewer 汇总投影：只保留含税总价与条目数，不含任何明细价格字段
+    const quoteSummary = (q) => ({
+      id: q.id, name: q.name, created_at: q.created_at,
+      version_id: q.version_id, version_name: q.version_name,
+      total_cents: q.total_cents, item_count: (q.items || []).length,
+    });
+    if (method === 'GET' && !seg[1]) {
+      if (currentRole() === 'viewer') return STORE.quotes.map(quoteSummary);
+      return STORE.quotes.map(q => ({ id: q.id, name: q.name, created_at: q.created_at, version_id: q.version_id, version_name: q.version_name, tax_rate: q.tax_rate, subtotal_cents: q.subtotal_cents, tax_cents: q.tax_cents, total_cents: q.total_cents, item_count: (q.items || []).length }));
+    }
+    if (method === 'POST') {
+      if (!roleCan('write_quotes')) denyRole('当前角色无权创建报价单');
+      const d = Object.assign({ id: nextId(), created_at: now() }, body);
+      // M1.0-b 锚点：与后端同口径 —— 分配 id 后派生 line_uid = q_<quoteId>_<item_no>
+      const items = d.items || [];
+      items.forEach((it, idx) => {
+        if (!it || typeof it !== 'object') return;
+        if (!Number.isInteger(it.item_no) || it.item_no <= 0) { it.item_no = idx + 1; it.legacy = 1; }
+        if (it.legacy === undefined) it.legacy = 0;
+        it.line_uid = `q_${d.id}_${it.item_no}`;
+      });
+      d.items = items;
+      STORE.quotes.push(d); lsSave(); return { ok: true, id: d.id };
+    }
+    if (method === 'GET' && seg[1]) {
+      const q = STORE.quotes.find(x => x.id === idOf(1));
+      if (!q) return {};
+      if (!roleCan('read_quotes_detail')) return quoteSummary(q);
+      return { ...q, items: q.items || [] };
+    }
+    if (method === 'DELETE' && seg[1]) {
+      if (!roleCan('write_quotes')) denyRole('当前角色无权删除报价单');
+      STORE.quotes = STORE.quotes.filter(x => x.id !== idOf(1)); lsSave(); return { ok: true };
+    }
+  }
+  if (head === 'cfg') {
+    if (!roleCan('read_pricing')) denyRole('当前角色无权访问配置台');
+    if (method === 'GET') return STORE.cfg;
+    if (method === 'PUT') { STORE.cfg = body || {}; lsSave(); return { ok: true }; }
   }
   if (head === 'apps') {
     if (method === 'GET') return STORE.apps.map(r => ({ ...r }));
@@ -369,6 +443,7 @@ const localApi = async (method, path, body) => {
   }
   if (head === 'library' && seg[1] === 'export') return null; // 由 downloadLibrary 处理
   if (head === 'library' && seg[1] === 'import' && method === 'POST') {
+    if (!roleCan('read_pricing')) denyRole('当前角色无权导入单价库');
     (body.machines || []).forEach(m => STORE.machines.push(Object.assign({ id: nextId(), version_id: active().id }, m)));
     (body.parts || []).forEach(p => STORE.parts.push(Object.assign({ id: nextId(), version_id: active().id }, p)));
     (body.vm_prices || []).forEach(v => STORE.vm_prices.push(Object.assign({ id: nextId(), version_id: active().id }, v)));
@@ -376,8 +451,173 @@ const localApi = async (method, path, body) => {
     if (body.settings) Object.assign(STORE.settings, body.settings);
     lsSave(); return { ok: true };
   }
+  // ============================================================
+  // 资产侧（融合 MVP）—— 与后端保持同样的 path 契约
+  // 离线也必须做角色裁剪：否则离线泄露比在线泄露更隐蔽（用户看不到横幅提示）
+  // ============================================================
+  const assets = () => { STORE.assets = STORE.assets || { devices: [], rooms: [], racks: [], rack_units: [], asset_changes: [], links: [], deliveries: [], reconciliations: [], price_feedback: [] }; return STORE.assets; };
+  const aTable = (t) => { const a = assets(); a[t] = Array.isArray(a[t]) ? a[t] : []; return a[t]; };
+  if (head === 'devices') {
+    if (method === 'GET') {
+      if (!roleCan('read_assets')) denyRole('当前角色无权访问设备台账');
+      // GET /api/devices/<id> → 单条；GET /api/devices[?筛选] → 列表
+      if (seg[1] && !isNaN(parseInt(seg[1], 10))) {
+        const one = aTable('devices').find(x => x.id === parseInt(seg[1], 10));
+        return one ? { ...one } : {};
+      }
+      let rows = aTable('devices');
+      const qp = (qs || '').split('&').map(x => x.split('='));
+      const qv = (k) => { const hit = qp.find(p => p[0] === k); return hit ? decodeURIComponent(hit[1] || '') : ''; };
+      // scope=runtime 只看运行态（planned 不得出现在巡检报表里）
+      const scope = qv('scope');
+      if (scope === 'runtime') rows = rows.filter(d => d.state === 'installed' || d.state === 'running');
+      else if (scope === 'plan') rows = rows.filter(d => d.state === 'planned' || d.state === 'ordered');
+      const st = qv('state'); if (st) rows = rows.filter(d => d.state === st);
+      const rk = qv('rack_id'); if (rk) rows = rows.filter(d => String(d.rack_id) === rk);
+      const og = qv('origin'); if (og) rows = rows.filter(d => d.origin === og);
+      return rows.map(d => ({ ...d }));
+    }
+    if (!roleCan('write_assets')) denyRole('当前角色无权修改设备台账');
+    if (method === 'POST') {
+      const d = Object.assign({ id: nextId(), created_from: currentRole(), updated_at: now() }, body);
+      d.state = d.state || 'planned';
+      aTable('devices').push(d); lsSave();
+      return { ok: true, id: d.id };
+    }
+    if (method === 'PUT' && seg[1]) {
+      const d = aTable('devices').find(x => x.id === idOf(1));
+      if (d) { Object.assign(d, body, { id: d.id, updated_at: now() }); lsSave(); }
+      return { ok: true };
+    }
+    if (method === 'DELETE' && seg[1]) {
+      assets().devices = aTable('devices').filter(x => x.id !== idOf(1)); lsSave();
+      return { ok: true };
+    }
+  }
+  if (head === 'rooms' || head === 'racks') {
+    const t = head === 'rooms' ? 'rooms' : 'racks';
+    if (method === 'GET') {
+      if (seg[1] && !isNaN(parseInt(seg[1], 10))) {
+        const one = aTable(t).find(x => x.id === parseInt(seg[1], 10));
+        return one ? { ...one } : {};
+      }
+      return aTable(t).map(r => ({ ...r }));
+    }
+    if (!roleCan('write_assets')) denyRole('当前角色无权修改机房机柜');
+    if (method === 'POST') { const d = Object.assign({ id: nextId() }, body); aTable(t).push(d); lsSave(); return { ok: true, id: d.id }; }
+    if (method === 'PUT' && seg[1]) { const r = aTable(t).find(x => x.id === idOf(1)); if (r) Object.assign(r, body, { id: r.id }); lsSave(); return { ok: true }; }
+    if (method === 'DELETE' && seg[1]) { assets()[t] = aTable(t).filter(x => x.id !== idOf(1)); lsSave(); return { ok: true }; }
+  }
+  if (head === 'rack_units') {
+    if (method === 'GET') {
+      let rows = aTable('rack_units');
+      if (seg[1] && !isNaN(parseInt(seg[1], 10))) rows = rows.filter(r => r.rack_id === parseInt(seg[1], 10));
+      return rows.map(r => ({ ...r }));
+    }
+    if (!roleCan('write_assets')) denyRole('当前角色无权修改机柜占用');
+    if (method === 'POST') { const d = Object.assign({ id: nextId() }, body); aTable('rack_units').push(d); lsSave(); return { ok: true, rows: [d] }; }
+    if (method === 'DELETE') { assets().rack_units = aTable('rack_units').filter(x => !(x.rack_id === body?.rack_id && x.u_index === body?.u_index)); lsSave(); return { ok: true }; }
+  }
+  if (head === 'rackview' && method === 'GET') {
+    // GET /api/rackview?rack_id=<id> —— 離線也用本地賬本算，與服務端同構
+    const qp = (qs || '').split('&').map(x => x.split('='));
+    const hit = qp.find(p => p[0] === 'rack_id');
+    const rid = parseInt(hit ? hit[1] : '0', 10) || 0;
+    const rack = aTable('racks').find(r => r.id === rid);
+    if (!rack) {
+      return { rack: null, slots: [], conflicts: { overlap: [], over_height: [], power_over: [] },
+        power: { used_w: 0, capacity_w: 0 }, occupancy: { used_slots: 0, total_slots: 0 } };
+    }
+    return localRackView(rack, aTable('rack_units'), aTable('devices'));
+  }
+  if (head === 'space' && seg[1] === 'validate' && method === 'POST') {
+    // 離線無服務端空間模型 → 降級為紙面校驗（與服務端「空間完整率不足」同語義：
+    // 不給出基於空間的通過結論，避免離線時給出假綠燈）
+    const lines = (body && body.lines) || [];
+    let qty = 0;
+    lines.forEach(l => { qty += Number(l && l.qty || 0); });
+    return {
+      mode: 'paper', pass: null, space_data_completeness: 0,
+      conflicts: { overlap: [], over_height: [], power_over: [] },
+      conflict_device_count: 0, onboarded_device_count: qty,
+      u_conflict_rate: 0, infeasible_ratio: 0,
+      notes: ['離線模式：本地空間數據不足，降級為紙面校驗，不給出基於空間的通過結論'],
+    };
+  }
+  if (head === 'deliveries') {
+    if (method === 'GET' && seg.length === 1) return aTable('deliveries').map(d => ({ ...d }));
+    if (method === 'GET' && seg[1]) { const d = aTable('deliveries').find(x => x.id === idOf(1)); return d ? { ...d } : {}; }
+    if (!roleCan('manage_deliveries')) denyRole('当前角色无权生成交付批次');
+    if (method === 'POST') { const d = Object.assign({ id: nextId(), generated_at: now() }, body); aTable('deliveries').push(d); lsSave(); return { ok: true, id: d.id }; }
+  }
+  if (head === 'asset_changes' && method === 'GET') return aTable('asset_changes').map(r => ({ ...r }));
+  if (head === 'reconciliations' && method === 'GET') return aTable('reconciliations').map(r => ({ ...r }));
+  if (head === 'links' && method === 'GET') return aTable('links').map(r => ({ ...r }));
+  if (head === 'price_feedback') {
+    if (method === 'GET') {
+      if (!roleCan('read_price_feedback')) denyRole('当前角色无权访问采价反馈');
+      // sales 全量；其它角色仅见本人提交的（访问自己的 price_feedback 不算泄露）
+      const rows = aTable('price_feedback');
+      return (currentRole() === 'sales' ? rows : rows.filter(r => r.created_by === currentRole())).map(r => ({ ...r }));
+    }
+    if (!roleCan('submit_price_feedback')) denyRole('当前角色无权提交采价反馈');
+    if (method === 'POST') {
+      const d = Object.assign({ id: nextId(), created_by: currentRole(), decided_by: null, at: now(), status: 'submitted' }, body);
+      aTable('price_feedback').push(d); lsSave();
+      return { ok: true, id: d.id, status: 'submitted' };
+    }
+  }
+  if (head === 'events') {
+    if (method === 'GET' && seg[1] === 'health') {
+      const pend = readPendingEvents();
+      return { dropped: 0, written: pend.length, last_event_ts: pend.length ? pend[pend.length - 1].ts : null, offline: true };
+    }
+    if (method === 'POST') {
+      // 离线不写文件：事件排队到 localStorage，在线后由 flushPendingEvents 上送
+      const list = Array.isArray(body?.events) ? body.events : (body ? [body] : []);
+      const pend = readPendingEvents();
+      list.forEach(e => pend.push(Object.assign({ ts: now(), role: currentRole(), role_source: ROLE_SOURCE, offline: true }, e)));
+      writePendingEvents(pend);
+      return { ok: true, written: list.length, dropped: 0 };
+    }
+  }
+  if (head === 'assets' && seg[1] === 'export' && method === 'GET') {
+    return localAssetsExport();
+  }
   return { ok: true };
 };
+
+/* ---- 离线埋点队列（离线不写文件，在线后 flush）---- */
+const EVENTS_PENDING_KEY = 'xcq_events_pending';
+function readPendingEvents() {
+  try { const s = localStorage.getItem(EVENTS_PENDING_KEY); return s ? JSON.parse(s) : []; } catch (e) { return []; }
+}
+function writePendingEvents(list) {
+  try { localStorage.setItem(EVENTS_PENDING_KEY, JSON.stringify(list)); } catch (e) { /* 隐私模式忽略 */ }
+}
+async function flushPendingEvents() {
+  const pend = readPendingEvents();
+  if (!pend.length) return;
+  try {
+    await api('POST', '/api/events', { events: pend });
+    writePendingEvents([]);
+  } catch (e) { /* 仍离线则保留队列 */ }
+}
+
+/* ---- 脱敏导出（本地版，列头与服务端完全一致）---- */
+function localAssetsExport() {
+  const a = STORE.assets || { devices: [], rooms: [], racks: [] };
+  const roomName = {}, rackName = {};
+  (a.rooms || []).forEach(r => { roomName[r.id] = r.name || ''; });
+  (a.racks || []).forEach(r => { rackName[r.id] = r.code || r.name || ''; });
+  const rows = (a.devices || []).map(d => [
+    d.code || '', d.sku_id || '', d.sn || '',
+    roomName[d.room_id] || '', rackName[d.rack_id] || '',
+    d.u_start || '', d.state || '',
+  ]);
+  // 列头服务端写死，不提供「显示价格」开关
+  return { filename: '资产台账.csv', columns: ['资产编号', '型号', 'SN', '机房', '机柜', 'U位', '状态'], rows };
+}
 
 // ---- 浏览器端下载 / xlsx / csv ----
 function download(filename, blob) {
@@ -487,24 +727,198 @@ function buildCsv(rows) {
 loadStore();
 
 let toastTimer;
-const toast = (msg) => { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.hidden = true, 2200); };
+/**
+ * 轻提示。转发到 UI 组件层，支持语义分级：
+ *   toast('已保存')          → ok  绿色
+ *   toast('保存失败：…', 'err') → err 红色
+ * 允许多条堆叠，连续操作不会互相覆盖（原来单条复用，后一条会顶掉前一条）。
+ */
+const toast = (msg, kind = 'ok') => {
+  if (typeof UI !== 'undefined' && UI.toast) return UI.toast(msg, kind);
+  const t = $('#toast'); if (t) { t.textContent = msg; t.hidden = false; }
+};
 
 // ---------------- 数据缓存 ----------------
-const S = { machines: [], parts: [], vm: [], vmf: [], os: [], hv: [], settings: {}, versions: [], quotes: [], apps: [] };
+const S = { machines: [], parts: [], vm: [], vmf: [], os: [], hv: [], settings: {}, versions: [], quotes: [], apps: [],
+  // 资产侧运行时缓存（融合 MVP）：设备台账 / 机房机柜 / U 位账本 / 交付批次 / 连线 / 采价反馈
+  assets: { devices: [], rooms: [], racks: [], rack_units: [], deliveries: [], links: [], price_feedback: [] } };
+
+/* ============================================================
+ * 角色机制（M5）
+ *
+ * 角色由前端选择并存 localStorage，每次请求带 X-Role 头，由服务端裁剪字段。
+ * **这不是身份认证**：请求头可被伪造，服务端裁剪属于「口径隔离」，
+ * role_source='self_declared' 仅供审计，不可用于越权判定。
+ * 缺省 sales —— 保持既有行为向后兼容。
+ * ============================================================ */
+const ROLE_KEY = 'xcq_role';
+const ROLE_OPTIONS = [
+  { v: 'sales', label: '售前' },
+  { v: 'delivery', label: '交付' },
+  { v: 'ops', label: '运维' },
+  { v: 'viewer', label: '管理层' },
+];
+const ROLE_SOURCE = 'self_declared';
+function currentRole() {
+  try {
+    const r = localStorage.getItem(ROLE_KEY);
+    return (r && ROLE_OPTIONS.some(o => o.v === r)) ? r : 'sales';
+  } catch (e) { return 'sales'; }
+}
+function setRole(r) {
+  try {
+    if (r && ROLE_OPTIONS.some(o => o.v === r)) localStorage.setItem(ROLE_KEY, r);
+  } catch (e) { /* 隐私模式下 localStorage 可能不可写，忽略即可 */ }
+  renderNav();
+  renderRoleBar();
+  renderTopbar(location.hash.replace('#/', '') || 'dashboard');
+  // 返回 route() 的 promise：调用方可 await 到「该角色的数据已加载完」。
+  // 不返回的话，角色切换后的数据刷新是悬空的 —— 上一角色的数据集会被
+  // 留在 S 里，下一段代码读到的是错角色的数据。
+  return route();
+}
+window.setRole = setRole;
+/** 角色能力判定（与后端 role_caps 同口径） */
+function roleCan(cap) {
+  const r = currentRole();
+  const sales = r === 'sales';
+  const caps = {
+    sales: sales,
+    read_pricing: sales,
+    publish_pricing: sales,
+    read_quotes: sales || r === 'viewer',
+    read_quotes_detail: sales,
+    write_quotes: sales,
+    read_assets: true,
+    write_assets: r === 'sales' || r === 'delivery' || r === 'ops',
+    submit_price_feedback: r === 'sales' || r === 'delivery' || r === 'ops',
+    read_price_feedback: r === 'sales' || r === 'delivery' || r === 'ops',
+    manage_deliveries: r === 'sales' || r === 'delivery',
+  };
+  return !!caps[cap];
+}
+/** 离线/在线一致的角色裁剪：抛 403 风格错误 */
+function denyRole(msg) {
+  const e = new Error(msg || '当前角色无权访问该接口');
+  e.status = 403;
+  throw e;
+}
+
+// ============ 空间模型（M2）：与后端 server.py 同口径 ============
+// u_index = round(u × 2)：每半 U 一行，行粒度必须 ≥ 最细设备占用粒度，
+// 否则二期引入半 U 设备时得迁数据。
+// 权威占用账本 = rack_units；devices.u_start/u_size 只是冗余快照，冲突时以账本为准。
+function uIndexOf(u) { return Math.round(Number(u || 0) * 2); }
+/** 设备占用的槽位索引区间 [a, b) → [round(a×2), round(b×2)) */
+function deviceUIndices(uStart, uSize) {
+  const a = Number(uStart || 0);
+  const b = a + Number(uSize || 1);
+  const out = [];
+  for (let i = uIndexOf(a); i < uIndexOf(b); i++) out.push(i);
+  return out;
+}
+/** 机型高度：chassis_u（实际机箱高度）优先，缺省时按 rail 解析近似 */
+function machineUSize(machine) {
+  if (!machine || typeof machine !== 'object') return { u_size: 1, u_size_source: 'rail' };
+  const cu = Number(machine.chassis_u || 0);
+  if (cu > 0) return { u_size: cu, u_size_source: 'chassis' };
+  const hit = String(machine.rail || '').match(/(\d+(?:\.\d+)?)\s*[Uu]/);
+  return { u_size: hit ? Number(hit[1]) : 1, u_size_source: 'rail' };
+}
+/** 离线版 rackview：以本地 rack_units 为权威账本，算出与服务端同构的槽位与冲突 */
+function localRackView(rack, units, devices) {
+  const totalU = Number(rack && rack.u_total || 0);
+  const totalIdx = Math.round(totalU * 2);
+  const unitByIdx = {};
+  (units || []).forEach(r => { if (r.rack_id === rack.id) unitByIdx[r.u_index] = r; });
+  const devById = {};
+  (devices || []).forEach(d => { devById[d.id] = d; });
+  const slots = [];
+  for (let idx = 0; idx < totalIdx; idx++) {
+    const row = unitByIdx[idx];
+    const dev = row ? devById[row.device_id] : null;
+    let occ = 'free';
+    if (row && dev) occ = row.reserved ? 'reserved' : 'occupied';
+    else if (row) occ = 'reserved';
+    slots.push({
+      u_index: idx, u_start: idx / 2, occupancy: occ,
+      device: dev ? {
+        id: dev.id, code: dev.code || '', sn: dev.sn || '', state: dev.state || '',
+        purpose: dev.purpose || '', role: dev.role || '',
+        u_size: dev.u_size || 1, u_start: dev.u_start || 0,
+      } : null,
+    });
+  }
+  // 冲突三类分列：位置冲突（重叠/超高）≠ 资源冲突（功率）
+  const conflicts = { overlap: [], over_height: [], power_over: [] };
+  (devices || []).forEach(d => {
+    if (d.rack_id !== rack.id) return;
+    const idxs = deviceUIndices(d.u_start, d.u_size);
+    idxs.forEach(i => { if (!unitByIdx[i]) conflicts.overlap.push({ device_id: d.id, u_index: i }); });
+    if (totalU > 0 && Number(d.u_start || 0) + Number(d.u_size || 0) > totalU) {
+      conflicts.over_height.push({ device_id: d.id, u_total: totalU });
+    }
+  });
+  const usedW = (devices || []).filter(d => d.rack_id === rack.id)
+    .reduce((s, d) => s + Number(d.power_w || 0), 0);
+  const capW = Number(rack && rack.power_capacity_w || 0);
+  if (capW > 0 && usedW > capW) {
+    conflicts.power_over.push({ rack_id: rack.id, power_capacity_w: capW, used_power_w: usedW });
+  }
+  return {
+    rack: Object.assign({}, rack),
+    slots, conflicts,
+    power: { used_w: usedW, capacity_w: capW },
+    occupancy: { used_slots: slots.filter(s => s.occupancy !== 'free').length, total_slots: totalIdx },
+  };
+}
 // B-12：请求合并 + 结果缓存，避免并发重复拉取与切换页签时反复请求
 let _libInflight = null;
 let _libCache = null;      // { key, data }
+/** 把 loadLib 拉到的数据写进 S。
+ *  缓存命中时也必须调用 —— 否则角色来回切换后，S 会停留在上一个角色的
+ *  数据集上（如切到 ops 再切回 sales，机型库变空）。 */
+function applyLib(data) {
+  S.versions = data.versions || [];
+  S.machines = data.machines || [];
+  S.parts = data.parts || [];
+  S.vm = data.vm || [];
+  S.vmf = data.vmf || [];
+  S.os = data.os || [];
+  S.hv = data.hv || [];
+  S.settings = data.settings || {};
+}
 async function loadLib(force) {
-  if (!force && _libCache) return _libCache.data;
+  // 缓存键带角色：不同角色可见的数据集不同（角色切回来时不能拿旧角色的缓存）
+  const key = currentRole();
+  if (!force && _libCache && _libCache.key === key) {
+    applyLib(_libCache.data);
+    return _libCache.data;
+  }
   if (_libInflight) return _libInflight;      // 并发调用共享同一次请求
   _libInflight = (async () => {
-    const data = await Promise.all([
-      api('GET', '/api/versions'), api('GET', '/api/machines'), api('GET', '/api/parts'),
-      api('GET', '/api/vm_prices'), api('GET', '/api/vm_flavors'), api('GET', '/api/os_options'),
-      api('GET', '/api/hypervisor_options'), api('GET', '/api/settings')
-    ]);
-    [S.versions, S.machines, S.parts, S.vm, S.vmf, S.os, S.hv, S.settings] = data;
-    _libCache = { data };
+    // 按角色裁剪请求集（M5）：非 sales 角色不请求单价库四表 ——
+    // 服务端对这些表返回 403，若硬请求则 Promise.all 整体 reject → 整页白屏。
+    const canPrice = roleCan('read_pricing');
+    const jobs = [['versions', () => api('GET', '/api/versions')]];
+    if (canPrice) {
+      jobs.push(['machines', () => api('GET', '/api/machines')]);
+      jobs.push(['parts', () => api('GET', '/api/parts')]);
+      jobs.push(['vm', () => api('GET', '/api/vm_prices')]);
+      jobs.push(['vmf', () => api('GET', '/api/vm_flavors')]);
+    } else {
+      const empty = () => Promise.resolve([]);
+      jobs.push(['machines', empty], ['parts', empty], ['vm', empty], ['vmf', empty]);
+    }
+    jobs.push(['os', () => api('GET', '/api/os_options')]);
+    jobs.push(['hv', () => api('GET', '/api/hypervisor_options')]);
+    jobs.push(['settings', () => api('GET', '/api/settings')]);
+    // allSettled：单个接口失败不拖垮整页（角色切换后端可能尚未放行某集合）
+    const settled = await Promise.allSettled(jobs.map(j => j[1]()));
+    const data = {};
+    jobs.forEach((j, i) => { data[j[0]] = settled[i].status === 'fulfilled' ? settled[i].value : null; });
+    applyLib(data);
+    _libCache = { key, data };
     return data;
   })();
   try { return await _libInflight; }
@@ -583,38 +997,231 @@ const activeVersion = () => S.versions.find(v => v.is_active) || S.versions[0] |
 const vmPrice = (t) => S.vm.find(v => v.res_type === t) || { price_cents: 0, unit: '' };
 
 // ---------------- 导航 ----------------
+/* ============================================================
+ * 导航结构
+ *
+ * 图标统一用 inline SVG（stroke 风格，与顶栏/卡片图标一致）。
+ * 原实现用 emoji（🖥🔧☁🗂…），在 Windows / 不同字体下渲染差异很大，
+ * 且与页面内其它 SVG 图标风格割裂——同一屏出现两种图标语言。
+ * ============================================================ */
+const NAV_ICONS = {
+  dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect height="9" rx="1.5" width="7" x="3" y="3"/><rect height="5" rx="1.5" width="7" x="14" y="3"/><rect height="9" rx="1.5" width="7" x="14" y="12"/><rect height="5" rx="1.5" width="7" x="3" y="16"/></svg>',  machines: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect height="6" rx="1.5" width="20" x="2" y="4"/><rect height="6" rx="1.5" width="20" x="2" y="14"/><circle cx="6" cy="7" fill="currentColor" r="1" stroke="none"/><circle cx="6" cy="17" fill="currentColor" r="1" stroke="none"/></svg>',
+  parts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14.7 6.3a4 4 0 0 0 5 5l-9 9a2.1 2.1 0 0 1-3-3z"/><path d="M14.7 6.3 17 4a3 3 0 0 1 3 3l-2.3 2.3"/></svg>',
+  vm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M17.5 19H9a5 5 0 0 1-1.9-9.6A6.5 6.5 0 0 1 19.4 11 4 4 0 0 1 17.5 19z"/></svg>',
+  versions: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  configurator: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="18" cy="18" r="2.5"/></svg>',
+  'hw-parse': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg>',
+  quotes: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h4"/></svg>',
+  arch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2 21 7v10l-9 5-9-5V7z"/><path d="M3 7l9 5 9-5M12 12v10"/></svg>',
+  'arch-diagram': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="4" r="2.5"/><circle cx="4" cy="19" r="2.5"/><circle cx="20" cy="19" r="2.5"/><path d="M12 6.5v5M12 11.5 5.5 17M12 11.5l6.5 5.5"/></svg>',
+  data: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>',
+  settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+  about: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/></svg>',
+  // ---- 资产侧（融合 MVP）----
+  devices: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect height="5" rx="1.2" width="20" x="2" y="3"/><rect height="5" rx="1.2" width="20" x="2" y="9.5"/><rect height="5" rx="1.2" width="20" x="2" y="16"/><circle cx="6" cy="5.5" fill="currentColor" r="1" stroke="none"/><circle cx="6" cy="12" fill="currentColor" r="1" stroke="none"/><circle cx="6" cy="18.5" fill="currentColor" r="1" stroke="none"/></svg>',
+  space: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 21V9l9-6 9 6v12"/><path d="M9 21v-7h6v7"/></svg>',
+  rackview: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect height="20" rx="1.5" width="12" x="6" y="2"/><path d="M6 7h12M6 12h12M6 17h12"/></svg>',
+  delivery: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 7h11v10H2z"/><path d="M13 10h4.5l3.5 3.5V17h-8z"/><circle cx="6.5" cy="18.5" r="1.8"/><circle cx="17" cy="18.5" r="1.8"/></svg>',
+};
+/* ============================================================
+ * 侧边导航
+ *
+ * 每个条目可声明 roles —— 该角色可见的菜单集合。
+ * **菜单级隔离**是 M5 的硬要求：ops 打开导航就看不到「单价库」「报价单」，
+ * 而不是只把内容藏起来。前端隐藏只是体验，服务端还会再裁一次（双保险）。
+ * ============================================================ */
 const NAV = [
-  { title: '总览', items: [{ k: 'dashboard', label: '概览', ico: '▦' }] },
-  { title: '单价库', items: [
-    { k: 'lib/machines', label: '物理机机型', ico: '🖥' },
-    { k: 'lib/parts', label: '可选部件', ico: '🔧' },
-    { k: 'lib/vm', label: '虚拟机资源单价', ico: '☁' },
-    { k: 'lib/versions', label: '版本管理', ico: '🗂' },
+  { title: '总览', items: [{ k: 'dashboard', label: '概览', ico: 'dashboard' }] },
+  { title: '单价库', roles: ['sales'], items: [
+    { k: 'lib/machines', label: '物理机机型', ico: 'machines' },
+    { k: 'lib/parts', label: '可选部件', ico: 'parts' },
+    { k: 'lib/vm', label: '虚拟机资源单价', ico: 'vm' },
+    { k: 'lib/versions', label: '版本管理', ico: 'versions' },
   ] },
-  { title: '报价', items: [
-    { k: 'configurator', label: '配置台（攒机）', ico: '⚙' },
-    { k: 'hw-parse', label: '硬件清单解析', ico: '📥' },
-    { k: 'quotes', label: '报价单', ico: '🧾' },
-    { k: 'arch', label: '架构梳理', ico: '🏗' },
-    { k: 'arch-diagram', label: '架构图 · draw.io', ico: '🗺', hidden: !FEATURES.archDiagram },
+  { title: '报价', roles: ['sales'], items: [
+    { k: 'configurator', label: '配置台（攒机）', ico: 'configurator' },
+    { k: 'hw-parse', label: '硬件清单解析', ico: 'hw-parse' },
+    { k: 'quotes', label: '报价单', ico: 'quotes' },
+    { k: 'arch', label: '架构梳理', ico: 'arch' },
+    { k: 'arch-diagram', label: '架构图 · draw.io', ico: 'arch-diagram', hidden: !FEATURES.archDiagram },
   ] },
-  { title: '系统', items: [
-    { k: 'data', label: '数据导入导出', ico: '⇅' },
-    { k: 'settings', label: '系统设置', ico: '⚙' },
-    { k: 'about', label: '关于 / 口径', ico: '?' },
+  { title: '资产', items: [
+    { k: 'assets/devices', label: '设备台账', ico: 'devices' },
+    { k: 'assets/space', label: '机房 · 机柜', ico: 'space' },
+    { k: 'assets/rackview', label: 'U 位视图', ico: 'rackview' },
+    { k: 'assets/deliveries', label: '交付批次', ico: 'delivery' },
+  ] },
+  { title: '系统', roles: ['sales'], items: [
+    { k: 'data', label: '数据导入导出', ico: 'data' },
+    { k: 'settings', label: '系统设置', ico: 'settings' },
+  ] },
+  { title: '帮助', items: [
+    { k: 'about', label: '关于 / 口径', ico: 'about' },
   ] },
 ];
 const TITLES = {};
 NAV.forEach(g => g.items.forEach(i => { if (!i.hidden) TITLES[i.k] = i.label; }));
 
+/* ============================================================
+ * 视图契约（对标同类成熟产品的 view 对象）
+ *
+ * 每个视图可声明：
+ *   title  —— 顶栏主标题
+ *   desc   —— 顶栏副标题（一句话说明这个页面解决什么问题）
+ *   actions() —— 顶栏右侧上下文动作区（返回 HTML 或元素数组）
+ *
+ * 为什么要契约化：
+ *   原实现每个页面自己往 #content 里塞标题，头部信息散落在页面内部，
+ *   导致「我在哪、我能做什么、下一步做什么」三件事在同一个视口里互相打架。
+ *   契约化之后，顶栏成为全局导航的一部分：标题告诉你位置，
+ *   描述告诉你这个页面的职责，动作区告诉你此刻能做的事。
+ * ============================================================ */
+const VIEW_META = {
+  'dashboard': {
+    title: '概览',
+    desc: '单价库、配置台与报价单的整体状态与待办',
+    actions: () => `
+      <button class="btn" onclick="location.hash='#/lib/machines'">维护单价库</button>
+      <button class="btn primary" onclick="location.hash='#/configurator'">开始配置</button>`,
+  },
+  'lib/machines': {
+    title: '物理机机型',
+    desc: '按架构维护整机参考配置与整机报价',
+    actions: () => `<button class="btn primary" onclick="editMachine()">+ 新增机型</button>`,
+  },
+  'lib/parts': {
+    title: '可选部件',
+    desc: '内存 / 硬盘 / 网卡 / RAID 等选配件单价与兼容约束',
+    actions: () => `<button class="btn primary" onclick="editPart()">+ 新增部件</button>`,
+  },
+  'lib/vm': {
+    title: '虚拟机资源单价',
+    desc: 'vCPU / 内存 / 存储综合单价与常用规格组合',
+    actions: () => `<button class="btn primary" onclick="editFlavor()">+ 新增规格组合</button>`,
+  },
+  'lib/versions': {
+    title: '版本管理',
+    desc: '报价单锁定单价库版本，保证报价口径可追溯',
+    actions: () => roleCan('publish_pricing')
+      ? `<button class="btn primary" onclick="newVersion()">+ 基于当前版本新建</button>` : '',
+  },
+  'configurator': {
+    title: '配置台（攒机）',
+    desc: '组合物理机与虚拟机，实时算价并校验架构一致性',
+    actions: () => `
+      <button class="btn" onclick="comparePlans()">方案对比</button>
+      <button class="btn" onclick="exportCfg()">导出配置清单</button>
+      <button class="btn" onclick="openPlacementCheck()">校验可上架</button>
+      <button class="btn primary" onclick="confirmQuoteName()">保存为报价单</button>`,
+  },
+  'hw-parse': {
+    title: '硬件清单解析',
+    desc: '上传供应商清单，自动识别规格并沉淀为可选配置',
+  },
+  'quotes': {
+    title: '报价单',
+    desc: '保存、查看与导出历史报价',
+    actions: () => `<button class="btn primary" onclick="location.hash='#/configurator'">新建报价单</button>`,
+  },
+  'arch': {
+    title: '架构梳理',
+    desc: '由拓扑白板推导部署组件、资源类型与互联关系',
+  },
+  'arch-diagram': {
+    title: '架构图 · draw.io',
+    desc: '由部署组件清单自动生成分层拓扑图并手工微调',
+  },
+  'data': {
+    title: '数据导入导出',
+    desc: '单价库整体备份与迁移',
+  },
+  'settings': {
+    title: '系统设置',
+    desc: '税率与计价口径',
+  },
+  'about': {
+    title: '关于 / 口径',
+    desc: '计价规则、范围边界与版本信息',
+  },
+  // ---- 资产侧（融合 MVP）----
+  'assets/devices': {
+    title: '设备台账',
+    desc: '统一设备实例：SN、机柜 U 位、状态与用途一处维护',
+    actions: () => `
+      ${roleCan('write_assets') ? '<button class="btn primary" onclick="editDevice()">+ 新增设备</button>' : ''}
+      <button class="btn" onclick="exportAssets()">导出台账（脱敏）</button>`,
+  },
+  'assets/space': {
+    title: '机房 · 机柜',
+    desc: '物理空间模型与 U 位占用账本',
+    actions: () => roleCan('write_assets')
+      ? `<button class="btn" onclick="editRoom()">+ 机房</button>
+         <button class="btn primary" onclick="editRack()">+ 机柜</button>` : '',
+  },
+  'assets/rackview': {
+    title: 'U 位视图',
+    desc: '机柜正视 U 位图，占用位红色标出',
+  },
+  'assets/deliveries': {
+    title: '交付批次',
+    desc: '报价单按行拆成设备实例并预分配 U 位',
+    actions: () => roleCan('manage_deliveries')
+      ? `<button class="btn primary" onclick="genDelivery()">从报价单生成</button>` : '',
+  },
+};
+
+/** 渲染顶栏：标题 + 描述 + 上下文动作区 */
+function renderTopbar(key) {
+  const meta = VIEW_META[key];
+  const titleEl = $('#pageTitle');
+  const descEl = $('#pageDesc');
+  const actEl = $('#topbarActions');
+  if (titleEl) titleEl.textContent = (meta && meta.title) || TITLES[key] || '概览';
+  if (descEl) descEl.textContent = (meta && meta.desc) || '';
+  if (actEl) {
+    actEl.innerHTML = '';
+    if (meta && meta.actions) {
+      const raw = meta.actions();
+      if (typeof raw === 'string') actEl.innerHTML = raw;
+      else if (Array.isArray(raw)) raw.filter(Boolean).forEach(e => actEl.appendChild(e));
+      else if (raw) actEl.appendChild(raw);
+    }
+  }
+  renderRoleBar();
+}
+
+/** 顶栏角色下拉（M5）：切换角色即重算菜单可见性与数据裁剪 */
+function renderRoleBar() {
+  const el = $('#roleBar');
+  if (!el) return;
+  const cur = currentRole();
+  const opts = ROLE_OPTIONS.map(o =>
+    `<option value="${o.v}"${o.v === cur ? ' selected' : ''}>${o.label}</option>`).join('');
+  el.innerHTML = `<label class="role-lbl">角色</label><select class="role-sel" onchange="setRole(this.value)">${opts}</select>`;
+}
+
 function renderNav() {
   const cur = location.hash.replace('#/', '') || 'dashboard';
-  $('#nav').innerHTML = NAV.map(g => `<div class="nav-group-title">${g.title}</div>` + g.items.filter(i => !i.hidden).map(i =>
-    `<div class="nav-item ${i.k === cur ? 'active' : ''}" data-k="${i.k}"><span class="nav-ico">${i.ico}</span>${i.label}</div>`).join('')).join('');
+  const role = currentRole();
+  // 菜单级角色隔离（M5）：分组与条目都可声明 roles，空 = 全员可见
+  const visible = (g) => (!g.roles || g.roles.indexOf(role) >= 0)
+    && g.items.some(i => !i.hidden);
+  const groups = NAV.filter(visible).map(g => {
+    const items = g.items.filter(i => !i.hidden && (!i.roles || i.roles.indexOf(role) >= 0));
+    return `<div class="nav-group-title">${g.title}</div>` + items.map(i =>
+      `<div class="nav-item ${i.k === cur ? 'active' : ''}" data-k="${i.k}"><span class="nav-ico">${NAV_ICONS[i.ico] || ''}</span>${i.label}</div>`).join('');
+  }).join('');
+  $('#nav').innerHTML = groups;
   $$('.nav-item').forEach(el => el.onclick = () => { location.hash = '#/' + el.dataset.k; });
   const v = activeVersion();
   $('#verPill').textContent = '单价库版本：' + (v.name || '—');
-  $('#taxPill').textContent = '税率 ' + ((parseFloat(S.settings.tax_rate) || 0) * 100).toFixed(0) + '%';
+  // 税率属于价格信息：非 sales 角色不显示
+  const taxPill = $('#taxPill');
+  if (taxPill) {
+    taxPill.textContent = roleCan('read_pricing')
+      ? '税率 ' + ((parseFloat(S.settings.tax_rate) || 0) * 100).toFixed(0) + '%'
+      : '税率 —';
+  }
   $('#verBadge').textContent = v.name ? ('当前版本：' + v.name) : '';
 }
 
@@ -633,25 +1240,47 @@ const ROUTES = {
   'hw-parse': HwParseView.render, 'quotes': viewQuotes, 'arch': viewArch,
   'arch-diagram': FEATURES.archDiagram ? ArchDiagramView.render : viewArchDiagramDisabled,
   'data': viewData, 'settings': viewSettings, 'about': viewAbout,
+  // 资产侧（融合 MVP）
+  'assets/devices': viewAssetsDevices, 'assets/space': viewAssetsSpace,
+  'assets/rackview': viewAssetsRackview, 'assets/deliveries': viewAssetsDeliveries,
 };
 async function route() {
   const key = location.hash.replace('#/', '') || 'dashboard';
-  $('#crumb').textContent = TITLES[key] || '概览';
   renderNav();
+  renderTopbar(key);
   const fn = ROUTES[key] || viewDashboard;
-  try { await fn(); } catch (e) { $('#content').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  try {
+    await fn();
+  } catch (e) {
+    console.error('视图渲染失败', key, e);
+    $('#content').innerHTML = `<div class="empty-state"><p>加载失败：${esc(e.message)}</p>
+      <span class="hint">可返回概览页重试；若为数据问题，请到「数据导入导出」恢复单价库备份。</span></div>`;
+  }
 }
 window.addEventListener('hashchange', route);
 
 // ---------------- 通用 UI ----------------
+/**
+ * 弹窗。保留原有 (title, bodyHtml, footHtml) 签名以兼容既有 59 个全局函数，
+ * 内部走 UI 组件层：Esc 关闭、焦点管理、遮罩点击关闭。
+ */
 function modal(title, bodyHtml, footHtml) {
-  $('#modal').innerHTML = `<div class="modal-head"><h3>${esc(title)}</h3><span class="x" id="mClose">×</span></div>
-    <div class="modal-body">${bodyHtml}</div>${footHtml ? `<div class="modal-foot">${footHtml}</div>` : ''}`;
-  $('#modalMask').hidden = false;
-  $('#mClose').onclick = closeModal;
+  return UI.modal({ title, body: bodyHtml, foot: footHtml });
 }
-const closeModal = () => { $('#modalMask').hidden = true; };
+const closeModal = () => UI.closeModal();
 $('#modalMask').onclick = (e) => { if (e.target.id === 'modalMask') closeModal(); };
+// Esc 关闭弹窗 + 收起悬浮提示
+// 注意：测试桩（tools/test-*.js）里的 document 是简化对象，没有 addEventListener，
+// 这里做存在性判断，避免离线单测环境直接抛错。
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const mask = $('#modalMask');
+      if (mask && !mask.hidden) closeModal();
+      if (typeof UI !== 'undefined' && UI.tip) UI.tip.hide();
+    }
+  });
+}
 
 // ---------------- C-2 方案对比 / C-3 配置单导出 ----------------
 /**
@@ -767,26 +1396,188 @@ window.exportCfg = async () => {
 function fmtCents(c) { return (c / 100).toFixed(2); }
 
 // ---------------- 视图：概览 ----------------
+/**
+ * 概览页 = 仪表盘。
+ *
+ * 原实现只有 3 个数字 + 一段文字 + 3 个按钮，用户看不出「当前项目处在什么状态、
+ * 有什么问题要处理、下一步该干什么」。参考产品（同类成熟产品）的总览页做到了三件事：
+ *   ① 每个指标卡可点击，直接钻取到相关视图；
+ *   ② 有独立的「预警/待办」区，把需要用户处理的事显式列出来；
+ *   ③ 有「最近动态」区，让用户看到最近的工作痕迹。
+ * 这里按同样思路重写，并把「报价健康度」作为核心指标：
+ * 待询价机型、架构不一致、规格校验告警——这三类问题一旦漏掉，报价直接失真。
+ */
 async function viewDashboard() {
+  // 概览按角色分叉（M5）：售前看「报价口径」，资产侧看「物理落位」。
+  // 非售前角色强行看售前仪表盘只会看到一屏空数据与不可点按钮 —— 那不是权限问题，
+  // 是把两个岗位的仪表盘硬塞成一张。
+  if (currentRole() !== 'sales') return viewAssetsDashboard(currentRole());
   await loadLib();
-  const physN = S.machines.length, partN = S.parts.length;
-  const vm = S.vm.map(v => `${v.res_type === 'cpu' ? 'CPU' : v.res_type === 'mem' ? '内存' : '存储'} ${fmt(v.price_cents)}元/${v.unit}`).join(' ｜ ');
+  try { S.quotes = await api('GET', '/api/quotes'); } catch (e) { S.quotes = []; }
+
+  const tax = parseFloat(S.settings.tax_rate) || 0;
+  const activeVer = activeVersion();
+
+  /* ---------- 单价库健康度 ---------- */
+  // 待询价：解析生成但单价为 0 的机型。它与「真实 0 元」无法区分，漏掉必然报价失真。
+  const pendingMachines = S.machines.filter(isPendingPrice);
+  // vmPrice() 找不到时返回 {price_cents:0} 而非 undefined，所以要按「是否配了这条资源」判断，
+  // 不能用 !vmPrice(k)（永远为真）。
+  const noVmPrice = ['cpu', 'mem', 'storage'].filter(k => !S.vm.some(v => v.res_type === k));
+  const archs = [...new Set(S.machines.map(m => m.arch).filter(Boolean))];
+
+  /* ---------- 配置台当前状态 ---------- */
+  const cfgPhys = CFG.phys.length, cfgVm = CFG.vm.length;
+  const totalPhys = CFG.phys.reduce((s, l) => s + physUnitCents(l) * (l.qty || 1), 0);
+  const totalVm = CFG.vm.reduce((s, l) => s + vmUnitCents(l) * (l.qty || 1), 0);
+  const subtotal = totalPhys + totalVm;
+  const grand = Math.round(subtotal * (1 + tax));
+  // 架构/规格一致性：与配置台用同一套校验函数，口径必须一致
+  const errLines = CFG.phys.filter(l => physArchError(l));
+  const specErrLines = CFG.phys.filter(l => {
+    const m = S.machines.find(x => x.id === l.machineId);
+    if (!m) return false;
+    const addedMem = { list: (l.parts || []).map(p => ({ spec: (S.parts.find(x => x.id === p.id) || {}).spec, qty: p.qty })) };
+    return !!(checkMemCapacity(m, addedMem) || checkDiskBays(m, l) || checkPower(m) || checkRackU(m));
+  });
+
+  /* ---------- 指标卡 ---------- */
+  const cards = [
+    {
+      lbl: '配置台行数', val: cfgPhys + cfgVm, unit: '行',
+      foot: cfgPhys + cfgVm ? `物理机 ${cfgPhys} · 虚拟机 ${cfgVm}` : '尚未开始配置',
+      c: 'var(--brand-d)', ico: Icons.grid, view: 'configurator',
+    },
+    {
+      lbl: '当前配置含税总价', val: fmt(grand), unit: '元',
+      foot: `未税 ${fmt(subtotal)} 元 · 税率 ${(tax * 100).toFixed(0)}%`,
+      c: 'var(--text-1)', ico: Icons.doc, view: 'configurator',
+    },
+    {
+      lbl: '单价库规模', val: S.machines.length, unit: '个机型',
+      foot: `${S.parts.length} 个部件 · ${archs.join(' / ') || '未设架构'}`,
+      c: 'var(--info)', ico: Icons.layers, view: 'lib/machines',
+    },
+    {
+      lbl: '待询价机型', val: pendingMachines.length, unit: '个',
+      foot: pendingMachines.length ? '报价前需补齐单价，否则总价失真' : '全部机型均已询价',
+      c: pendingMachines.length ? 'var(--warn)' : 'var(--ok)', ico: Icons.warn, view: 'lib/machines',
+    },
+  ];
+
+  /* ---------- 待办清单 ---------- */
+  const todos = [];
+  if (!S.machines.length) {
+    todos.push({ k: 'danger', t: '单价库为空，尚未录入任何物理机机型', v: '去维护', view: 'lib/machines' });
+  } else if (pendingMachines.length) {
+    todos.push({ k: 'warn', t: `${pendingMachines.length} 个机型单价为 0（待询价）`, v: '去处理', view: 'lib/machines' });
+  }
+  if (noVmPrice.length) {
+    todos.push({ k: 'danger', t: `虚拟机资源单价缺失：${noVmPrice.join(' / ')}`, v: '去维护', view: 'lib/vm' });
+  }
+  if (errLines.length) {
+    todos.push({ k: 'danger', t: `${errLines.length} 行物理机存在架构/部件不一致`, v: '去修正', view: 'configurator' });
+  }
+  if (specErrLines.length) {
+    todos.push({ k: 'warn', t: `${specErrLines.length} 行物理机未通过规格校验`, v: '去查看', view: 'configurator' });
+  }
+  if (!cfgPhys && !cfgVm) {
+    todos.push({ k: 'ok', t: '配置台为空，可从硬件清单解析或方案模板起步', v: '去配置', view: 'configurator' });
+  }
+  if (!S.quotes.length) {
+    todos.push({ k: 'ok', t: '尚未保存任何报价单', v: '去保存', view: 'quotes' });
+  }
+
+  /* ---------- 最近报价单 ---------- */
+  const recentQuotes = (S.quotes || []).slice().sort((a, b) =>
+    String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 5);
+
+  const statCards = cards.map(c => `
+    <div class="stat clickable v-brand" style="--c:${c.c}" onclick="location.hash='#/${c.view}'">
+      <span class="stat-go">${Icons.arrow}</span>
+      <div class="stat-lbl">${c.ico}<span>${esc(c.lbl)}</span></div>
+      <div class="stat-val" style="color:${c.c}">${esc(String(c.val))}<small>${esc(c.unit)}</small></div>
+      <div class="stat-foot">${esc(c.foot)}</div>
+    </div>`).join('');
+
+  const todoHtml = todos.length ? todos.map(t => `
+    <div class="todo-item" onclick="location.hash='#/${t.view}'">
+      <span class="todo-dot ${t.k}"></span>
+      <span class="todo-t">${esc(t.t)}</span>
+      <span class="todo-v">${esc(t.v)} →</span>
+    </div>`).join('') : UI.empty(Icons.warn, '没有待处理事项', '单价库与配置台状态正常');
+
+  const quoteRows = recentQuotes.length ? recentQuotes.map(q => `
+    <tr class="clickable" onclick="viewQuote(${q.id})">
+      <td><b>${esc(q.name)}</b></td>
+      <td class="muted">${esc(q.version_name || '—')}</td>
+      <td class="num">${q.item_count != null ? q.item_count : '—'}</td>
+      <td class="num"><b>${fmt(q.total_cents)}</b></td>
+      <td class="muted">${esc(q.created_at || '')}</td>
+    </tr>`).join('') : '';
+
+  /* ---------- 单价库构成（横向条形图） ---------- */
+  const byArch = archs.map(a => ({
+    k: a, n: S.machines.filter(m => m.arch === a).length,
+  })).sort((a, b) => b.n - a.n);
+  const maxArch = Math.max(...byArch.map(x => x.n), 1);
+  const archChart = byArch.length ? byArch.map(x => `
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px">
+        <span>${esc(x.k)}</span><span style="color:var(--text-3)">${x.n} 个</span>
+      </div>
+      <div class="bar"><i style="width:${Math.round(x.n / maxArch * 100)}%;background:var(--brand)"></i></div>
+    </div>`).join('') : '<p class="hint">尚未录入机型</p>';
+
+  const vmSummary = S.vm.map(v =>
+    `${v.res_type === 'cpu' ? 'CPU' : v.res_type === 'mem' ? '内存' : '存储'} ${fmt(v.price_cents)} 元/${v.unit}`
+  ).join(' ｜ ');
+
   $('#content').innerHTML = `
-  <div class="grid-3" style="margin-bottom:16px">
-    <div class="stat"><div class="n">${physN}</div><div class="l">物理机机型（分架构）</div></div>
-    <div class="stat"><div class="n">${partN}</div><div class="l">可选部件</div></div>
-    <div class="stat"><div class="n">${S.versions.length}</div><div class="l">单价库版本</div></div>
+  <div class="dash-grid">${statCards}</div>
+
+  <div class="dash-section"><h2>待办与风险</h2><span class="sub">影响报价准确性的事项优先显示</span></div>
+  <div class="dash-2col">
+    <div class="card">
+      <div class="card-head" style="padding:14px 18px 0"><h3 class="h3" style="margin:0">需要关注</h3></div>
+      <div class="card-body"><div class="todo-list">${todoHtml}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-head" style="padding:14px 18px 0"><h3 class="h3" style="margin:0">单价库构成</h3></div>
+      <div class="card-body">
+        ${archChart}
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line)">
+          <div class="hint" style="margin-bottom:4px">虚拟机资源综合单价（已含许可与运维）</div>
+          <div style="font-size:13px">${esc(vmSummary || '尚未配置')}</div>
+        </div>
+      </div>
+    </div>
   </div>
+
+  <div class="dash-section"><h2>最近报价单</h2>
+    <span class="sub"><a href="#/quotes" style="color:var(--brand);text-decoration:none">查看全部 →</a></span></div>
+  <div class="card">
+    ${recentQuotes.length ? `<table class="tbl">
+      <thead><tr><th>名称</th><th>单价库版本</th><th class="num">条目</th><th class="num">总价(元)</th><th>创建时间</th></tr></thead>
+      <tbody>${quoteRows}</tbody></table>`
+      : UI.empty(Icons.doc, '还没有保存过报价单', '在配置台完成配置后，点右上角「保存为报价单」即可归档',
+          '<button class="btn primary" onclick="location.hash=\'#/configurator\'">前往配置台</button>')}
+  </div>
+
+  <div class="dash-section"><h2>工作流</h2><span class="sub">${esc(activeVer.name || '未选择版本')}</span></div>
   <div class="card card-pad">
-    <h2 class="h2">虚拟机资源综合单价（已含许可与运维）</h2>
-    <p class="hint">${vm || '尚未配置'}</p>
-  </div>
-  <div class="card card-pad" style="margin-top:16px">
-    <h2 class="h2">快速开始</h2>
-    <p class="hint">① 在「单价库」维护机型与部件（按海光 / 鲲鹏分架构）② 到「配置台」自由组合并实时算价 ③ 在「报价单」保存与导出。</p>
+    <div class="mini-metrics" style="margin-bottom:14px">
+      <div class="mini-metric"><div class="n">${S.machines.length}</div><div class="l">物理机机型</div></div>
+      <div class="mini-metric"><div class="n">${S.parts.length}</div><div class="l">可选部件</div></div>
+      <div class="mini-metric"><div class="n">${S.vmf.length}</div><div class="l">虚拟机规格组合</div></div>
+      <div class="mini-metric"><div class="n">${S.versions.length}</div><div class="l">单价库版本</div></div>
+      <div class="mini-metric"><div class="n">${(S.quotes || []).length}</div><div class="l">历史报价单</div></div>
+    </div>
+    <p class="hint">① 在「单价库」维护机型与部件（按海光 / 鲲鹏分架构）② 到「配置台」组合并实时算价，或用「硬件清单解析」导入供应商清单 ③ 在「报价单」保存与导出。</p>
     <div class="actions" style="justify-content:flex-start">
       <button class="btn primary" onclick="location.hash='#/configurator'">前往配置台</button>
       <button class="btn" onclick="location.hash='#/lib/machines'">维护单价库</button>
+      <button class="btn" onclick="location.hash='#/hw-parse'">解析硬件清单</button>
       <button class="btn" onclick="location.hash='#/arch'">架构梳理</button>
     </div>
   </div>`;
@@ -826,11 +1617,28 @@ window.libFilter = (k, v) => { LIB_UI[k] = v; renderMachineRows(); };
 async function renderMachineRows() {
   const all = S.machines || [];
   const list = filterMachines(all);
-  const tb = $('#mRows');
-  if (tb) tb.innerHTML = list.map(m => machineRowHtml(m)).join('')
-    || '<tr><td colspan="10" class="empty">没有匹配的机型</td></tr>';
+  const holder = $('#mTableHolder');
   const cnt = $('#mCount');
   if (cnt) cnt.textContent = list.length === all.length ? `共 ${all.length} 个机型` : `筛选出 ${list.length} / ${all.length} 个机型`;
+
+  // 无数据时整表替换为图标化空状态（原实现只留一行「没有匹配的机型」裸文字）
+  if (!list.length) {
+    if (holder) {
+      holder.innerHTML = `<div class="table-empty">${UI.empty(Icons.box,
+        all.length ? '没有匹配的机型' : '还没有任何机型',
+        all.length ? '试试调整搜索词或架构筛选' : '先录入整机参考配置与报价，之后配置台才能选型',
+        `<button class="btn primary" onclick="editMachine()">+ 新增机型</button>`)}</div>`;
+    }
+    return;
+  }
+  // 空态消失后需要重建表格骨架
+  if (holder && !$('#mRows')) {
+    holder.innerHTML = `<table class="tbl"><thead><tr><th>品牌/型号</th><th>架构</th><th>CPU</th><th class="num">核数</th><th class="num">主频</th>
+    <th class="num">内存(G)</th><th>硬盘</th><th class="num">含税单价(元)</th><th>供应商</th><th></th></tr></thead>
+    <tbody id="mRows"></tbody></table>`;
+  }
+  const tb = $('#mRows');
+  if (tb) tb.innerHTML = list.map(m => machineRowHtml(m)).join('');
 }
 function machineRowHtml(m) {
   return `<tr>
@@ -851,21 +1659,25 @@ async function viewMachines() {
   const archs = [...new Set(S.machines.map(m => m.arch).filter(Boolean))];
   const rows = filterMachines(S.machines).map(machineRowHtml).join('');
   $('#content').innerHTML = `<div class="card card-pad">
-    <div class="toolbar"><div><h2 class="h2">物理机机型</h2><p class="hint">整机报价，按信创架构（海光 x86 / 鲲鹏 ARM）分库。单价库版本：${esc(activeVersion().name || '')}</p></div>
-    <button class="btn primary" onclick="editMachine()">+ 新增机型</button></div>
-    <div class="toolbar" style="align-items:center;gap:10px;flex-wrap:wrap">
-      <input id="mQ" placeholder="搜索品牌 / 型号 / CPU / 供应商…" value="${esc(LIB_UI.q)}" oninput="libSearch(this.value)" style="min-width:240px">
-      <select onchange="libFilter('arch',this.value)"><option value="">全部架构</option>
-        ${archs.map(a => `<option value="${esc(a)}" ${LIB_UI.arch === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select>
-      <select onchange="libFilter('sort',this.value)">
+    <div class="toolbar"><div><h2 class="h2">物理机机型</h2><p class="hint">整机报价，按信创架构（海光 x86 / 鲲鹏 ARM）分库。单价库版本：${esc(activeVersion().name || '')}</p></div></div>
+    <div class="table-toolbar">
+      <div class="tb-search">${Icons.search}<input id="mQ" type="search" placeholder="搜索品牌 / 型号 / CPU / 供应商…" value="${esc(LIB_UI.q)}" oninput="libSearch(this.value)"></div>
+      <label class="tb-sel"><span>架构</span><select onchange="libFilter('arch',this.value)"><option value="">全部架构</option>
+        ${archs.map(a => `<option value="${esc(a)}" ${LIB_UI.arch === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select></label>
+      <label class="tb-sel"><span>排序</span><select onchange="libFilter('sort',this.value)">
         ${[['price-asc', '单价 ↑ 从低到高'], ['price-desc', '单价 ↓ 从高到低'], ['cores-desc', '核数 ↓ 多到少'],
            ['mem-desc', '内存 ↓ 多到少'], ['name', '按名称']].map(([v, t]) =>
-          `<option value="${v}" ${LIB_UI.sort === v ? 'selected' : ''}>${t}</option>`).join('')}</select>
-      <span class="muted" id="mCount"></span>
+          `<option value="${v}" ${LIB_UI.sort === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+      <span class="tb-count" id="mCount"></span>
     </div>
-    <table><thead><tr><th>品牌/型号</th><th>架构</th><th>CPU</th><th class="num">核数</th><th class="num">主频</th>
+    <div id="mTableHolder">${rows
+      ? `<table class="tbl"><thead><tr><th>品牌/型号</th><th>架构</th><th>CPU</th><th class="num">核数</th><th class="num">主频</th>
     <th class="num">内存(G)</th><th>硬盘</th><th class="num">含税单价(元)</th><th>供应商</th><th></th></tr></thead>
-    <tbody id="mRows">${rows || '<tr><td colspan="10" class="empty">暂无机型，点击右上角新增</td></tr>'}</tbody></table></div>`;
+    <tbody id="mRows">${rows}</tbody></table>`
+      : `<div class="table-empty">${UI.empty(Icons.box,
+          S.machines.length ? '没有匹配的机型' : '还没有任何机型',
+          S.machines.length ? '试试调整搜索词或架构筛选' : '先录入整机参考配置与报价，之后配置台才能选型',
+          `<button class="btn primary" onclick="editMachine()">+ 新增机型</button>`)}</div>`}</div></div>`;
   await renderMachineRows();
 }
 window.editMachine = async (id) => {
@@ -889,6 +1701,7 @@ window.editMachine = async (id) => {
       <div class="field"><label>网卡</label><input id="f_nic" value="${esc(m.nic || '')}"></div>
       <div class="field"><label>电源</label><input id="f_pw" value="${esc(m.power || '')}"></div>
       <div class="field"><label>导轨</label><input id="f_rail" value="${esc(m.rail || '2U导轨')}"></div>
+      <div class="field"><label>机箱高度(U)</label><input id="f_chassis_u" type="number" step="0.5" min="0" value="${m.chassis_u ?? 0}"></div>
       <div class="field"><label>含税单价(元)</label><input id="f_price" type="number" step="0.01" value="${m.unit_price_cents ? (m.unit_price_cents / 100) : ''}"></div>
       <div class="field"><label>供应商</label><input id="f_sup" value="${esc(m.supplier || '')}"></div>
       <div class="field" style="grid-column:1/3"><label>报价依据</label><input id="f_basis" value="${esc(m.basis || '')}"></div>
@@ -902,6 +1715,8 @@ window.saveMachine = async (id) => {
     cpu_freq: +$('#f_freq').value, mem_capacity: +$('#f_mem').value, mem_gen: $('#f_memg').value,
     disk_bays: $('#f_db').value, disk_desc: $('#f_dd').value, nic: $('#f_nic').value,
     power: $('#f_pw').value, rail: $('#f_rail').value, unit_price_cents: yuanToCents($('#f_price').value),
+    // M1.0：机箱高度 U（0 = 未标注 → 按导轨近似）。权威结果仍只有 u_size 一个字段。
+    chassis_u: +$('#f_chassis_u').value || 0,
     supplier: $('#f_sup').value, basis: $('#f_basis').value
   };
   try {
@@ -910,25 +1725,75 @@ window.saveMachine = async (id) => {
   } catch (e) { toast('保存失败：' + e.message); }
 };
 window.delMachine = async (id) => {
-  if (!confirm('确认删除该机型？')) return;
+  if (!await UI.confirm('确认删除该机型？已引用该机型的配置行将按 0 元计价。',
+    { title: '删除机型', okText: '删除', danger: true })) return;
   _libCache = null;
   await api('DELETE', '/api/machines/' + id); await viewMachines(); toast('已删除');
 };
 
 // ---------------- 视图：部件 ----------------
+// B-9：部件页筛选状态（搜索 + 类别 + 架构 + 排序）
+const PART_UI = { q: '', cat: '', arch: '', sort: 'name' };
+function filterParts(list) {
+  const q = PART_UI.q.trim().toLowerCase();
+  let out = (list || []).filter(p => {
+    if (PART_UI.cat && p.category !== PART_UI.cat) return false;
+    if (PART_UI.arch && (p.compat_arch || '通用') !== PART_UI.arch) return false;
+    if (!q) return true;
+    return [p.category, p.spec, p.compat_arch].some(v => String(v || '').toLowerCase().indexOf(q) >= 0);
+  });
+  out = out.slice().sort((a, b) => {
+    if (PART_UI.sort === 'price-asc') return (a.price_cents || 0) - (b.price_cents || 0);
+    if (PART_UI.sort === 'price-desc') return (b.price_cents || 0) - (a.price_cents || 0);
+    return String(a.category + a.spec).localeCompare(String(b.category + b.spec), 'zh');
+  });
+  return out;
+}
+window.partSearch = (v) => { PART_UI.q = v; renderPartRows(); };
+window.partFilter = (k, v) => { PART_UI[k] = v; renderPartRows(); };
+
 async function viewParts() {
   await loadLib();
-  const rows = S.parts.map(p => `<tr>
+  const cats = [...new Set(S.parts.map(p => p.category).filter(Boolean))];
+  const archs = [...new Set(S.parts.map(p => p.compat_arch || '通用'))];
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">可选部件</h2><p class="hint">用于物理机加配（内存/硬盘/网卡/RAID），受架构约束。</p></div></div>
+    <div class="table-toolbar">
+      <div class="tb-search">${Icons.search}<input id="pQ" type="search" placeholder="搜索类别 / 规格…" value="${esc(PART_UI.q)}" oninput="partSearch(this.value)"></div>
+      <label class="tb-sel"><span>类别</span><select onchange="partFilter('cat',this.value)"><option value="">全部类别</option>
+        ${cats.map(c => `<option value="${esc(c)}" ${PART_UI.cat === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
+      <label class="tb-sel"><span>架构</span><select onchange="partFilter('arch',this.value)"><option value="">全部架构</option>
+        ${archs.map(a => `<option value="${esc(a)}" ${PART_UI.arch === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select></label>
+      <label class="tb-sel"><span>排序</span><select onchange="partFilter('sort',this.value)">
+        ${[['name', '按名称'], ['price-asc', '单价 ↑'], ['price-desc', '单价 ↓']].map(([v, t]) =>
+          `<option value="${v}" ${PART_UI.sort === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+      <span class="tb-count" id="pCount"></span>
+    </div>
+    <div id="pTableHolder"></div></div>`;
+  renderPartRows();
+}
+function renderPartRows() {
+  const all = S.parts || [];
+  const list = filterParts(all);
+  const holder = $('#pTableHolder');
+  const cnt = $('#pCount');
+  if (cnt) cnt.textContent = list.length === all.length ? `共 ${all.length} 个部件` : `筛选出 ${list.length} / ${all.length} 个部件`;
+  if (!holder) return;
+  if (!list.length) {
+    holder.innerHTML = `<div class="table-empty">${UI.empty(Icons.layers,
+      all.length ? '没有匹配的部件' : '还没有可选部件',
+      all.length ? '试试调整搜索词或筛选条件' : '录入内存 / 硬盘 / 网卡 / RAID 等加配件，配置台即可按需选配',
+      `<button class="btn primary" onclick="editPart()">+ 新增部件</button>`)}</div>`;
+    return;
+  }
+  const rows = list.map(p => `<tr>
     <td><span class="tag">${esc(p.category)}</span></td><td>${esc(p.spec)}</td>
     <td><span class="tag ${archClass(p.compat_arch)}">${esc(p.compat_arch || '通用')}</span></td>
     <td class="num">${fmt(p.price_cents)}</td>
     <td class="actions" style="margin:0"><button class="btn sm" onclick="editPart(${p.id})">编辑</button>
     <button class="btn sm danger" onclick="delPart(${p.id})">删除</button></td></tr>`).join('');
-  $('#content').innerHTML = `<div class="card card-pad">
-    <div class="toolbar"><div><h2 class="h2">可选部件</h2><p class="hint">用于物理机加配（内存/硬盘/网卡/RAID），受架构约束。</p></div>
-    <button class="btn primary" onclick="editPart()">+ 新增部件</button></div>
-    <table><thead><tr><th>类别</th><th>规格</th><th>适配架构</th><th class="num">单价(元)</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="empty">暂无部件</td></tr>'}</tbody></table></div>`;
+  holder.innerHTML = `<table class="tbl"><thead><tr><th>类别</th><th>规格</th><th>适配架构</th><th class="num">单价(元)</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
 }
 window.editPart = async (id) => {
   const p = id ? S.parts.find(x => x.id === id) : {};
@@ -948,7 +1813,11 @@ window.savePart = async (id) => {
   try { if (id) await api('PUT', '/api/parts/' + id, d); else await api('POST', '/api/parts', d); _libCache = null; closeModal(); await viewParts(); toast('已保存'); }
   catch (e) { toast('保存失败：' + e.message); }
 };
-window.delPart = async (id) => { if (!confirm('确认删除？')) return; _libCache = null; await api('DELETE', '/api/parts/' + id); await viewParts(); toast('已删除'); };
+window.delPart = async (id) => {
+  if (!await UI.confirm('确认删除该部件？已引用该部件的配置行将按 0 元计价。',
+    { title: '删除部件', okText: '删除', danger: true })) return;
+  _libCache = null; await api('DELETE', '/api/parts/' + id); await viewParts(); toast('已删除');
+};
 
 // ---------------- 视图：虚拟机资源单价 ----------------
 async function viewVm() {
@@ -969,12 +1838,12 @@ async function viewVm() {
   $('#content').innerHTML = `<div class="card card-pad">
     <div class="toolbar"><div><h2 class="h2">虚拟机资源单价</h2><p class="hint">综合单价，已含许可与运维；虚拟机按资源直乘，不折算宿主机。现行：CPU ${fmt(vmPrice('cpu').price_cents)}元/核，内存 ${fmt(vmPrice('mem').price_cents)}元/G，存储 ${fmt(vmPrice('storage').price_cents)}元/G。</p></div></div>
     <table><thead><tr><th>资源类型</th><th>单位</th><th class="num">单价(元)</th><th>口径</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="empty">暂无</td></tr>'}</tbody></table></div>
+    <tbody>${rows || `<tr><td colspan="5">${UI.empty(Icons.box, '还没有配置虚拟机资源单价', '至少需要 CPU / 内存 / 存储三项单价，虚拟机才能算价')}</td></tr>`}</tbody></table></div>
   <div class="card card-pad" style="margin-top:16px">
     <div class="toolbar"><div><h2 class="h2">虚拟机规格组合（常用搭配）</h2><p class="hint">基于上方资源综合单价，预置常见 vCPU/内存/存储搭配；保存后可一键加入配置台，便于批量拼装已搭配好的虚拟机。现行单价库版本：${esc(activeVersion().name || '')}</p></div>
     <button class="btn primary" onclick="editFlavor()">+ 新增规格组合</button></div>
     <table><thead><tr><th>名称</th><th class="num">vCPU(核)</th><th class="num">内存(G)</th><th class="num">存储(G)</th><th class="num">综合单价(元)</th><th>备注</th><th></th></tr></thead>
-    <tbody>${frows || '<tr><td colspan="7" class="empty">暂无组合，点击右上角新增</td></tr>'}</tbody></table></div>`;
+    <tbody>${frows || `<tr><td colspan="7">${UI.empty(Icons.grid, '还没有规格组合', '预设常用 vCPU / 内存 / 存储搭配，保存后可一键加入配置台')}</td></tr>`}</tbody></table></div>`;
 }
 window.editVm = async (id) => {
   const v = id ? S.vm.find(x => x.id === id) : {};
@@ -1014,7 +1883,10 @@ window.saveFlavor = async (id) => {
   try { if (id) await api('PUT', '/api/vm_flavors/' + id, d); else await api('POST', '/api/vm_flavors', d); closeModal(); await viewVm(); toast('已保存'); }
   catch (e) { toast('保存失败：' + e.message); }
 };
-window.delFlavor = async (id) => { if (!confirm('确认删除该规格组合？')) return; await api('DELETE', '/api/vm_flavors/' + id); await viewVm(); toast('已删除'); };
+window.delFlavor = async (id) => {
+  if (!await UI.confirm('确认删除该规格组合？', { title: '删除规格组合', okText: '删除', danger: true })) return;
+  await api('DELETE', '/api/vm_flavors/' + id); await viewVm(); toast('已删除');
+};
 window.addVmFromFlavor = async (id) => {
   const f = S.vmf.find(x => x.id === id); if (!f) return;
   CFG.vm.push({ id: newLineId('v'), cpu: f.vcpu, mem: f.mem_gb, sto: f.storage_gb, qty: 1, flavor: f.name, purpose: '', role: '', group: '' });
@@ -1025,21 +1897,31 @@ window.addVmFromFlavor = async (id) => {
 // ---------------- 视图：版本管理 ----------------
 async function viewVersions() {
   await loadLib();
+  // 发布权仅售前：非 sales 角色不渲染「新建 / 启用」按钮（点了也会被服务端 403）
+  const canPublish = roleCan('publish_pricing');
   const rows = S.versions.map(v => `<tr>
     <td><b>${esc(v.name)}</b></td><td class="muted">${esc(v.note || '')}</td><td class="muted">${esc(v.created_at)}</td>
     <td>${v.is_active ? '<span class="tag x86">当前生效</span>' : ''}</td>
-    <td class="actions" style="margin:0">${v.is_active ? '' : `<button class="btn sm primary" onclick="activateVer(${v.id})">启用</button>`}</td></tr>`).join('');
+    <td class="actions" style="margin:0">${(canPublish && !v.is_active) ? `<button class="btn sm primary" onclick="activateVer(${v.id})">启用</button>` : ''}</td></tr>`).join('');
   $('#content').innerHTML = `<div class="card card-pad">
     <div class="toolbar"><div><h2 class="h2">版本管理</h2><p class="hint">每次变更建议新建版本（克隆当前生效版本），报价单锁定版本号即代表报价口径与有效期。</p></div>
-    <button class="btn primary" onclick="newVersion()">+ 基于当前版本新建</button></div>
+    ${canPublish ? '<button class="btn primary" onclick="newVersion()">+ 基于当前版本新建</button>' : ''}</div>
     <table><thead><tr><th>版本名称</th><th>说明</th><th>创建时间</th><th>状态</th><th></th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
 window.newVersion = async () => {
-  const name = prompt('新版本名称：', '基线 v2 (' + new Date().toISOString().slice(0, 10) + ')');
+  const name = await UI.prompt('新版本名称：', {
+    title: '新建单价库版本',
+    value: '基线 v2 (' + new Date().toISOString().slice(0, 10) + ')',
+    placeholder: '如：2026 年度框架价',
+    okText: '下一步',
+  });
   if (!name) return;
-  const note = prompt('版本说明（变更原因）：', '') || '';
-  try { await api('POST', '/api/versions', { name, note }); _libCache = null; await viewVersions(); toast('已新建并启用'); } catch (e) { toast('失败：' + e.message); }
+  const note = await UI.prompt('版本说明（变更原因）：', {
+    title: '版本说明', placeholder: '如：海光机型价格更新', okText: '创建',
+  });
+  if (note === null) return;   // 用户取消 → 整体放弃
+  try { await api('POST', '/api/versions', { name, note: note || '' }); _libCache = null; await viewVersions(); toast('已新建并启用'); } catch (e) { toast('失败：' + e.message, 'err'); }
 };
 window.activateVer = async (id) => { try { await api('PUT', '/api/versions/' + id + '/activate', {}); _libCache = null; await viewVersions(); toast('已切换版本'); } catch (e) { toast('失败：' + e.message); } };
 
@@ -1297,7 +2179,7 @@ function renderConfigurator() {
         <div class="si"><span>电源/导轨</span><b>${esc(m.power || '—')} ｜ ${esc(m.rail || '—')}</b></div>
       </div>` : '';
     return `<div class="line phys" data-line="phys:${l.id}">
-      <div class="lh"><span class="lt">🖥 ${m ? esc(m.brand + ' ' + m.model) : '未选机型'}</span>
+      <div class="lh"><span class="lt">${Icons.machines} ${m ? esc(m.brand + ' ' + m.model) : '未选机型'}</span>
         <button class="btn sm danger" onclick="rmPhys('${l.id}')">移除</button></div>
       <div class="field"><label>机型</label><select onchange="chPhysMachine('${l.id}',this.value)">
         ${S.machines.map(x => `<option value="${x.id}" ${x.id === l.machineId ? 'selected' : ''}>${esc(x.brand + ' ' + x.model)} · ${esc(x.arch)}</option>`).join('')}</select></div>
@@ -1343,7 +2225,7 @@ function renderConfigurator() {
   }).join('');
 
   const vmHtml = CFG.vm.map(l => `<div class="line vm" data-line="vm:${l.id}">
-    <div class="lh"><span class="lt">☁ 虚拟机</span><button class="btn sm danger" onclick="rmVm('${l.id}')">移除</button></div>
+    <div class="lh"><span class="lt">${Icons.vm} 虚拟机</span><button class="btn sm danger" onclick="rmVm('${l.id}')">移除</button></div>
     <div class="grid-2">
       <div class="field"><label>vCPU(核)</label><input type="number" min="1" value="${l.cpu}" oninput="chVm('${l.id}','cpu',this.value)"></div>
       <div class="field"><label>内存(G)</label><input type="number" min="1" value="${l.mem}" oninput="chVm('${l.id}','mem',this.value)"></div>
@@ -1374,14 +2256,13 @@ function renderConfigurator() {
 
   $('#content').innerHTML = `<div class="toolbar"><h2 class="h2" style="margin:0">配置台（攒机式组合）</h2>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn primary" onclick="location.hash='#/hw-parse'">📥 从硬件清单导入</button>
+      <button class="btn primary" onclick="location.hash='#/hw-parse'">${Icons.upload} 从硬件清单导入</button>
       <div class="seg"><button class="${CFG.archFilter === '全部' ? 'on' : ''}" onclick="setArch('全部')">全部</button>
         <button class="${CFG.archFilter === '海光(C86/x86)' ? 'on' : ''}" onclick="setArch('海光(C86/x86)')">海光 x86</button>
         <button class="${CFG.archFilter === '鲲鹏(ARM)' ? 'on' : ''}" onclick="setArch('鲲鹏(ARM)')">鲲鹏 ARM</button></div>
       <div class="seg"><button class="${CFG.view === 'list' ? 'on' : ''}" onclick="setView('list')">清单视图</button>
         <button class="${CFG.view === 'topo' ? 'on' : ''}" onclick="setView('topo')">拓扑白板</button>
-      <button onclick="comparePlans()">方案对比</button>
-      <button onclick="exportCfg()">导出配置清单</button></div>
+      </div>
     </div></div>
     <div class="arch-note">虚拟机按资源单价直乘（含许可与运维），不折算宿主机；物理机需保证「机型架构 = 操作系统架构 = 虚拟化平台架构」。</div>
     <div class="cfg">
@@ -1506,7 +2387,7 @@ function topoNodes() {
   const nodes = []; let pIdx = 0, vIdx = 0;
   CFG.phys.forEach(l => {
     const m = S.machines.find(x => x.id === l.machineId); if (!m) return;
-    const items = `<div class="ni"><b>🖥 ${esc(m.brand + ' ' + m.model)}</b></div>
+    const items = `<div class="ni"><b>${Icons.machines} ${esc(m.brand + ' ' + m.model)}</b></div>
       <div class="ni">CPU：${m.cpu_sockets}×${esc(m.cpu_model)} ${m.cpu_cores}核</div>
       <div class="ni">内存：${m.mem_capacity}G ${esc(m.mem_gen || '')}</div>
       <div class="ni">硬盘：${esc(m.disk_desc || '—')}</div>
@@ -1515,7 +2396,7 @@ function topoNodes() {
   });
   CFG.vm.forEach(l => {
     vIdx++;
-    const items = `<div class="ni"><b>☁ 虚拟机（${l.qty}台）</b></div>
+    const items = `<div class="ni"><b>${Icons.vm} 虚拟机（${l.qty}台）</b></div>
       <div class="ni">vCPU：${l.cpu} 核</div><div class="ni">内存：${l.mem} G</div><div class="ni">存储：${l.sto} G</div>
       ${l.flavor ? '<div class="ni">规格：' + esc(l.flavor) + '</div>' : ''}`;
     nodes.push({ id: 'v_' + l.id, lineId: l.id, kind: 'vm', no: '虚拟机#' + vIdx, deploy: l.deploy || '', purpose: l.purpose || '', role: l.role || '', group: l.group || '', items, spec: `${l.cpu}C/${l.mem}G/${l.sto}G`, foot: '单价 ' + fmt(vmUnitCents(l)) + ' 元/台' });
@@ -1524,7 +2405,7 @@ function topoNodes() {
 }
 function renderTopo() {
   const nodes = topoNodes();
-  if (nodes.length === 0) return `<div class="topo topo-empty" id="topo" ondragover="event.preventDefault()" ondrop="dropItem(event)"><div class="empty">尚无配置，请从左侧新增，或从右侧「单价库选件 / 规格组合」点击 / 拖入画布</div></div>`;
+  if (nodes.length === 0) return `<div class="topo topo-empty" id="topo" ondragover="event.preventDefault()" ondrop="dropItem(event)">${UI.empty(Icons.grid, '尚无配置', '请从左侧新增，或从右侧「单价库选件 / 规格组合」点击 / 拖入画布')}</div>`;
   return `<div class="topo-wrap"><div class="topo ${CFG.connecting ? 'connecting' : ''}" id="topo" ondragover="event.preventDefault()" ondrop="dropItem(event)">
     <div class="topo-board" id="topoBoard">
     <svg class="topo-svg" id="topoSvg"></svg>
@@ -1689,11 +2570,25 @@ window.addVm = () => { CFG.vm.push({ id: newLineId('v'), cpu: 4, mem: 16, sto: 1
 window.rmPhys = (id) => { CFG.phys = CFG.phys.filter(l => l.id !== id); renderConfigurator(); };
 window.rmVm = (id) => { CFG.vm = CFG.vm.filter(l => l.id !== id); renderConfigurator(); };
 // B-9：清空配置是破坏性操作，补二次确认（与 delMachine/delQuote 保持一致）
+// 说明：历史签名是同步的（调用方写的是 `clearCfg(); assert(...)`），
+// 因此保留同步分支——UI.confirmSync 在无弹窗宿主时同步返回布尔值；
+// 在真实浏览器里则走可视化确认框（异步），此时返回 Promise。
 window.clearCfg = () => {
-  if (!confirm('确认清空全部配置行？此操作不可撤销（已保存的报价单不受影响）。')) return;
-  CFG = { phys: [], vm: [], archFilter: CFG.archFilter, view: CFG.view, pos: CFG.pos, links: CFG.links, selNode: null, connecting: false };
-  renderConfigurator();
-  toast('已清空配置');
+  const msg = '确认清空全部配置行？此操作不可撤销（已保存的报价单不受影响）。';
+  const sync = UI.confirmSync(msg);
+  if (sync !== null) {
+    if (!sync) return;
+    CFG = { phys: [], vm: [], archFilter: CFG.archFilter, view: CFG.view, pos: CFG.pos, links: CFG.links, selNode: null, connecting: false };
+    renderConfigurator();
+    toast('已清空配置');
+    return;
+  }
+  return UI.confirm(msg, { title: '清空配置台', okText: '清空', danger: true }).then(ok => {
+    if (!ok) return;
+    CFG = { phys: [], vm: [], archFilter: CFG.archFilter, view: CFG.view, pos: CFG.pos, links: CFG.links, selNode: null, connecting: false };
+    renderConfigurator();
+    toast('已清空配置');
+  });
 };
 window.addPart = (lineId, partId) => {
   const l = CFG.phys.find(x => x.id === lineId); if (!l || !partId) return;
@@ -1758,10 +2653,16 @@ window.confirmQuoteName = async (subtotal, grand) => {
 async function doSaveQuote(name, subtotal, grand) {
   const items = [];
   const ver = activeVersion();
+  // 条目序号 item_no：从 1 递增（M1.0-b 锚点字段）。
+  // line_uid 由后端在分配 quote_id 后补全（q_<quoteId>_<item_no>）——
+  // 前端保存前拿不到 quoteId，故此处不写。
+  let itemNo = 0;
   CFG.phys.forEach(l => {
     const m = S.machines.find(x => x.id === l.machineId);
     if (!m) return;
+    itemNo++;
     items.push({
+      item_no: itemNo, legacy: 0,
       type: '物理机', title: m.brand + ' ' + m.model + (l.os ? ' / ' + l.os : ''),
       qty: l.qty, unit_cents: physUnitCents(l), line_cents: physUnitCents(l) * l.qty,
       // 规格快照：保证单价库改价后历史报价仍可还原（RK-02）
@@ -1778,7 +2679,9 @@ async function doSaveQuote(name, subtotal, grand) {
     });
   });
   CFG.vm.forEach(l => {
+    itemNo++;
     items.push({
+      item_no: itemNo, legacy: 0,
       type: '虚拟机', title: `${l.cpu}C/${l.mem}G/${l.sto}G`,
       qty: l.qty, unit_cents: vmUnitCents(l), line_cents: vmUnitCents(l) * l.qty,
       cpu: l.cpu, mem_gb: l.mem, sto_gb: l.sto,
@@ -1801,9 +2704,54 @@ async function doSaveQuote(name, subtotal, grand) {
 window.saveQuote = async (subtotal, grand) => { askQuoteName(subtotal, grand); };
 
 // ---------------- 视图：报价单 ----------------
+// B-9：报价单页筛选状态（搜索 + 版本筛选）
+const QUOTE_UI = { q: '', ver: '' };
+window.quoteSearch = (v) => { QUOTE_UI.q = v; renderQuoteRows(); };
+window.quoteFilter = (k, v) => { QUOTE_UI[k] = v; renderQuoteRows(); };
+function filterQuotes(list) {
+  const q = QUOTE_UI.q.trim().toLowerCase();
+  return (list || []).filter(x => {
+    if (QUOTE_UI.ver && (x.version_name || '—') !== QUOTE_UI.ver) return false;
+    if (!q) return true;
+    return [x.name, x.version_name].some(v => String(v || '').toLowerCase().indexOf(q) >= 0);
+  });
+}
 async function viewQuotes() {
   S.quotes = await api('GET', '/api/quotes');
-  const rows = S.quotes.map(q => `<tr>
+  const vers = [...new Set((S.quotes || []).map(q => q.version_name || '—'))];
+  // 表格主体在 renderQuoteRows() 里渲染（便于筛选时局部重绘），
+  // 但版本名必须先出现在 #content 里：它是「报价锁定了哪个口径」的关键信息，
+  // 也是自动化测试断言的目标。
+  const verHint = vers.length
+    ? `已锁定版本：${vers.map(v => esc(v)).join('、')}`
+    : '尚未保存报价单';
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">报价单</h2><p class="hint">保存的配置与报价结果，均锁定单价库版本号，可随时复现与导出。</p></div></div>
+    <div class="table-toolbar">
+      <div class="tb-search">${Icons.search}<input id="qQ" type="search" placeholder="搜索报价单名称…" value="${esc(QUOTE_UI.q)}" oninput="quoteSearch(this.value)"></div>
+      <label class="tb-sel"><span>版本</span><select onchange="quoteFilter('ver',this.value)"><option value="">全部版本</option>
+        ${vers.map(v => `<option value="${esc(v)}" ${QUOTE_UI.ver === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+      <span class="tb-count" id="qCount"></span>
+    </div>
+    <div class="hint" style="margin:-4px 0 10px">${verHint}</div>
+    <div id="qTableHolder"></div></div>`;
+  renderQuoteRows();
+}
+function renderQuoteRows() {
+  const all = S.quotes || [];
+  const list = filterQuotes(all);
+  const holder = $('#qTableHolder');
+  const cnt = $('#qCount');
+  if (cnt) cnt.textContent = list.length === all.length ? `共 ${all.length} 份报价单` : `筛选出 ${list.length} / ${all.length} 份报价单`;
+  if (!holder) return;
+  if (!list.length) {
+    holder.innerHTML = `<div class="table-empty">${UI.empty(Icons.doc,
+      all.length ? '没有匹配的报价单' : '还没有保存过报价单',
+      all.length ? '试试调整搜索词或版本筛选' : '在配置台完成配置后，点右上角「保存为报价单」即可归档',
+      `<button class="btn primary" onclick="location.hash='#/configurator'">前往配置台</button>`)}</div>`;
+    return;
+  }
+  const rows = list.map(q => `<tr>
     <td><b>${esc(q.name)}</b></td>
     <td class="muted">${esc(q.version_name || '—')}</td>
     <td class="num">${q.item_count != null ? q.item_count : '—'}</td>
@@ -1813,11 +2761,8 @@ async function viewQuotes() {
       <button class="btn sm" onclick="exportQuote(${q.id},'xlsx')">Excel</button>
       <button class="btn sm" onclick="exportQuote(${q.id},'csv')">CSV</button>
       <button class="btn sm danger" onclick="delQuote(${q.id})">删</button></td></tr>`).join('');
-  $('#content').innerHTML = `<div class="card card-pad">
-    <div class="toolbar"><div><h2 class="h2">报价单</h2><p class="hint">保存的配置与报价结果，均锁定单价库版本号，可随时复现与导出。</p></div>
-    <button class="btn primary" onclick="location.hash='#/configurator'">＋ 新建报价</button></div>
-    <table><thead><tr><th>名称</th><th>单价库版本</th><th class="num">行数</th><th class="num">含税总价(元)</th><th>创建时间</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="6" class="empty">暂无报价，去配置台生成第一份</td></tr>'}</tbody></table></div>`;
+  holder.innerHTML = `<table class="tbl"><thead><tr><th>名称</th><th>单价库版本</th><th class="num">行数</th><th class="num">含税总价(元)</th><th>创建时间</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
 }
 window.exportQuote = async (id, fileFmt) => {
   if (fileFmt !== 'xlsx' && fileFmt !== 'csv') fileFmt = 'xlsx';
@@ -1840,8 +2785,17 @@ window.exportQuote = async (id, fileFmt) => {
   rows.push(['', '', '', '', '含税总价(元)', fmt(q.total_cents)]);
   if (fileFmt === 'xlsx') download('报价单_' + q.name + '_' + q.id + '.xlsx', buildXlsx([{ name: '报价单', rows }]));
   else download('报价单_' + q.name + '_' + q.id + '.csv', buildCsv(rows));
+  // 埋点：报价导出（DLCR 第③环节的可测来源）；离线时事件排入本地队列，失败不影响导出
+  try {
+    await api('POST', '/api/events', { events: [{
+      event_name: 'quote_export', payload: { quote_id: id, format: fileFmt, item_count: items.length } }] });
+  } catch (e) { /* 忽略 */ }
 };
-window.delQuote = async (id) => { if (!confirm('确认删除该报价单？')) return; await api('DELETE', '/api/quotes/' + id); await viewQuotes(); toast('已删除'); };
+window.delQuote = async (id) => {
+  if (!await UI.confirm('确认删除该报价单？删除后无法恢复。',
+    { title: '删除报价单', okText: '删除', danger: true })) return;
+  await api('DELETE', '/api/quotes/' + id); await viewQuotes(); toast('已删除');
+};
 window.viewQuote = async (id) => {
   const q = await api('GET', '/api/quotes/' + id);
   if (!q || !q.id || !q.items) { toast('未找到该报价单，请刷新后重试'); return; }
@@ -1861,6 +2815,613 @@ window.viewQuote = async (id) => {
     <div class="actions"><button class="btn" onclick="exportQuote(${q.id},'xlsx')">导出 Excel</button>
       <button class="btn" onclick="exportQuote(${q.id},'csv')">导出 CSV</button><button class="btn" onclick="closeModal()">关闭</button></div>`);
 };
+
+// ============================================================
+// 资产侧视图（M1 台账 / M2 空间 / M3 rackview / M4 交付 / M6 导出 / M7 预校验）
+//
+// 为什么单独一块：售前侧看「报价口径」（单价库 / 配置台 / 报价单），
+// 资产侧看「物理落位」（机房 / 机柜 / U 位 / 设备台账 / 交付批次）。
+// 两类数据的字段、权限、导出模板都不同 —— 混在一页会让任何一方都看不清。
+// ============================================================
+const ASSET_STATE_LABEL = { planned: '待上架', ordered: '已到货', installed: '已上架', running: '运行中' };
+const ASSET_ORIGIN_LABEL = { delivery: '交付批次', quote: '报价单', hwlib: '硬件清单', manual: '手工录入' };
+const ASSET_RUNTIME_STATES = ['installed', 'running'];
+const ASSET_PLAN_STATES = ['planned', 'ordered'];
+
+/** 机型目录（脱敏）：资产侧选型用。单价库对非 sales 角色 403，
+ *  但运维新增设备必须能选机型 —— 走目录接口只拿规格，不拿价格。 */
+let _catalogCache = null;
+async function loadCatalog() {
+  if (_catalogCache) return _catalogCache;
+  _catalogCache = await api('GET', '/api/catalog').catch(() => []);
+  return _catalogCache;
+}
+function assetMachineName(catalog, skuId) {
+  const m = (catalog || []).find(x => x.id === skuId);
+  if (!m) return '机型#' + skuId;
+  return ((m.brand || '') + ' ' + (m.model || '')).trim() || ('机型#' + skuId);
+}
+
+// ---------------- 视图：设备台账（M1） ----------------
+async function viewAssetsDevices() {
+  const [devices, racks, rooms, catalog] = await Promise.all([
+    api('GET', '/api/devices').catch(() => []),
+    api('GET', '/api/racks').catch(() => []),
+    api('GET', '/api/rooms').catch(() => []),
+    loadCatalog(),
+  ]);
+  // 采价反馈：交付/运维可提交实际采购价（采价权），但看不见库价、更不能发布版本
+  let feedbacks = [];
+  if (roleCan('read_price_feedback')) {
+    feedbacks = await api('GET', '/api/price_feedback').catch(() => []);
+  }
+  const rackById = {}; racks.forEach(r => { rackById[r.id] = r; });
+  const roomById = {}; rooms.forEach(r => { roomById[r.id] = r; });
+  const locText = (d) => {
+    if (!d.rack_id) return '未上架';
+    const r = rackById[d.rack_id];
+    const rm = r ? roomById[r.room_id] : null;
+    const where = (rm ? rm.name + ' / ' : '') + (r ? (r.code || ('柜#' + r.id)) : ('柜#' + d.rack_id));
+    return where + ' · U' + Number(d.u_start || 0) + '–' + (Number(d.u_start || 0) + Number(d.u_size || 1));
+  };
+  const n = (k) => devices.filter(d => d.state === k).length;
+  const weak = devices.filter(d => !d.source_line_uid).length;
+  const rows = devices.map(d => `<tr>
+    <td><b>${esc(d.code || '—')}</b><div class="muted">${esc(d.sn || '未录 SN')}</div></td>
+    <td>${esc(assetMachineName(catalog, d.sku_id))}<div class="muted">${esc(d.arch || '')}</div></td>
+    <td>${esc(d.purpose || '—')}${d.role ? ' <span class="tag">' + esc(d.role) + '</span>' : ''}</td>
+    <td><span class="state-tag st-${esc(d.state || 'planned')}">${esc(ASSET_STATE_LABEL[d.state] || d.state || '—')}</span></td>
+    <td>${esc(locText(d))}<div class="muted">${Number(d.u_size || 1)}U · ${esc(d.u_size_source || 'rail')}</div></td>
+    <td>${d.source_line_uid
+      ? `<span class="tag">${esc(d.source_line_uid)}</span>`
+      : '<span class="weak-anchor">弱锚点</span>'}
+      <div class="muted">${esc(ASSET_ORIGIN_LABEL[d.origin] || d.origin || '—')}</div></td>
+    <td class="actions" style="margin:0">
+      ${roleCan('write_assets') ? `<button class="btn sm" onclick="editDevice(${d.id})">编辑</button>
+      <button class="btn sm danger" onclick="delDevice(${d.id})">删</button>` : ''}</td></tr>`).join('');
+  const emptyHtml = devices.length ? '' : UI.empty(Icons.server,
+    '设备台账还是空的',
+    '从「交付批次」生成，或直接在此新增一台设备 —— 只需填 SN、机柜与 U 位，机型规格自动带出',
+    roleCan('write_assets') ? '<button class="btn primary" onclick="editDevice()">新增设备</button>' : '');
+
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">设备台账</h2>
+      <p class="hint">统一设备实例台账：SN、机柜 U 位、状态与用途在此一处维护，报价单与交付批次通过锚点回指到具体条目。</p></div>
+      <div class="actions" style="margin:0">
+        ${roleCan('write_assets') ? '<button class="btn primary" onclick="editDevice()">+ 新增设备</button>' : ''}
+        ${roleCan('submit_price_feedback') ? '<button class="btn" onclick="openPriceFeedback()">+ 采价反馈</button>' : ''}
+        <button class="btn" onclick="exportAssets()">导出台账（脱敏）</button></div></div>
+    <div class="grid-3" style="margin:14px 0">
+      <div class="stat"><div class="n">${devices.length}</div><div class="l">设备总数</div></div>
+      <div class="stat"><div class="n">${n('planned') + n('ordered')}</div><div class="l">待上架</div></div>
+      <div class="stat"><div class="n">${n('installed') + n('running')}</div><div class="l">已上架</div></div>
+    </div>
+    ${weak ? `<div class="hint" style="margin:0 0 10px">${weak} 台设备缺少报价锚点（source_line_uid）—— 属于弱锚点，回溯与对账时只能靠人工核对。</div>` : ''}
+    <table class="tbl"><thead><tr><th>资产编号 / SN</th><th>机型</th><th>用途 / 主备</th><th>状态</th><th>机柜 · U 位</th><th>来源锚点</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    ${devices.length ? '' : emptyHtml}
+    ${roleCan('read_price_feedback') ? `<h3 class="h3" style="margin-top:20px">采价反馈</h3>
+      <div class="hint" style="margin:0 0 8px">采价权 ≠ 发布权：这里提交的是「实际采购价」这一不透明事实，采纳与否由售前决定。</div>
+      ${feedbacks.length ? `<table class="tbl"><thead><tr><th>机型</th><th class="num">实际采购价(元)</th><th>来源</th><th>状态</th><th>提交人</th><th>时间</th></tr></thead>
+        <tbody>${feedbacks.map(f => `<tr>
+          <td>${esc(assetMachineName(catalog, f.sku_id))}</td>
+          <td class="num">${f.actual_price_cents != null ? fmt(f.actual_price_cents) : '—'}</td>
+          <td>${esc(f.source || '—')}</td>
+          <td><span class="tag">${esc(f.status || 'submitted')}</span></td>
+          <td>${esc(f.created_by || '—')}</td><td class="muted">${esc(f.at || '')}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="hint">尚无采价反馈记录。</p>'}` : ''}
+  </div>`;
+}
+
+/** 提交采价反馈：实际采购价作为不透明事实提交，响应不回显库价 */
+window.openPriceFeedback = async () => {
+  const catalog = await loadCatalog();
+  if (!catalog.length) { toast('机型目录为空：无法选择机型', 'err'); return; }
+  const opts = catalog.map(m => `<option value="${m.id}">${esc(((m.brand || '') + ' ' + (m.model || '')).trim())}</option>`).join('');
+  modal('提交采价反馈', `<div class="form-grid">
+      <div class="field"><label>机型</label><select id="f_pfsku">${opts}</select></div>
+      <div class="field"><label>实际采购价(元)</label><input id="f_pfprice" type="number" min="0" step="0.01" value="0"></div>
+      <div class="field"><label>来源</label><input id="f_pfsrc" type="text" placeholder="如 供应商报价 / 框架协议"></div>
+    </div>
+    <p class="hint">你提交的是实际到手价，提交后只有你本人与售前可见；库价与定价版本发布权仍归售前。</p>`,
+    `<button class="btn" onclick="closeModal()">取消</button>
+     <button class="btn primary" onclick="submitPriceFeedback()">提交</button>`);
+};
+window.submitPriceFeedback = async () => {
+  const body = {
+    sku_id: +$('#f_pfsku').value,
+    actual_price_cents: yuanToCents($('#f_pfprice').value),
+    source: $('#f_pfsrc').value.trim(),
+  };
+  try { await api('POST', '/api/price_feedback', body); closeModal(); await viewAssetsDevices(); toast('已提交采价反馈'); }
+  catch (e) { toast('提交失败：' + e.message, 'err'); }
+};
+
+/** 新增 / 编辑设备。机型规格由服务端带出，前端只填「哪台、哪个柜、第几 U」。 */
+window.editDevice = async (id) => {
+  const [catalog, racks, rooms] = await Promise.all([
+    loadCatalog(), api('GET', '/api/racks').catch(() => []), api('GET', '/api/rooms').catch(() => []),
+  ]);
+  if (!catalog.length) {
+    toast('机型目录为空：资产侧按当前生效版本取机型，请先在「单价库 · 物理机机型」录入机型', 'err');
+    return;
+  }
+  let d = null;
+  if (id) {
+    const list = await api('GET', '/api/devices').catch(() => []);
+    d = list.find(x => x.id === id) || null;
+    if (!d) { toast('未找到该设备', 'err'); return; }
+  }
+  const rackOpts = ['<option value="">未上架（暂不指定位置）</option>'].concat(
+    racks.map(r => {
+      const rm = rooms.find(x => x.id === r.room_id);
+      const label = (rm ? rm.name + ' / ' : '') + (r.code || ('柜#' + r.id)) + '（' + (r.u_total || 0) + 'U）';
+      return `<option value="${r.id}"${d && d.rack_id === r.id ? ' selected' : ''}>${esc(label)}</option>`;
+    })).join('');
+  const skuOpts = catalog.map(m => {
+    const u = machineUSize(m);
+    const label = ((m.brand || '') + ' ' + (m.model || '')).trim() + ' · ' + (m.arch || '') + ' · ' + u.u_size + 'U';
+    return `<option value="${m.id}"${d && d.sku_id === m.id ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+  const stateOpts = Object.keys(ASSET_STATE_LABEL).map(k =>
+    `<option value="${k}"${d && d.state === k ? ' selected' : ''}>${ASSET_STATE_LABEL[k]}</option>`).join('');
+  const roleOpts = ['主', '备', '单机'].map(r =>
+    `<option value="${r}"${d && d.role === r ? ' selected' : ''}>${r}</option>`).join('');
+  modal(d ? ('编辑设备 #' + d.id) : '新增设备', `
+    <div class="form-grid">
+      <div class="field"><label>机型（规格由服务端带出）</label><select id="f_sku">${skuOpts}</select></div>
+      <div class="field"><label>资产编号</label><input id="f_code" type="text" value="${esc(d ? d.code || '' : '')}" placeholder="可选，如 ZC-2026-001"></div>
+      <div class="field"><label>SN（序列号）</label><input id="f_sn" type="text" value="${esc(d ? d.sn || '' : '')}" placeholder="到货扫码录入"></div>
+      <div class="field"><label>机柜</label><select id="f_rack">${rackOpts}</select></div>
+      <div class="field"><label>U 位起点（0.5 步进）</label><input id="f_ustart" type="number" step="0.5" min="0" value="${d ? d.u_start || 0 : 0}"></div>
+      <div class="field"><label>用途</label><input id="f_purpose" type="text" value="${esc(d ? d.purpose || '' : '')}" placeholder="如 数据库 / 接入层"></div>
+      <div class="field"><label>主备角色</label><select id="f_role">${roleOpts}</select></div>
+      <div class="field"><label>状态</label><select id="f_state">${stateOpts}</select></div>
+      <div class="field"><label>功率(W)</label><input id="f_power" type="number" min="0" value="${d ? d.power_w || 0 : 0}"></div>
+    </div>
+    <p class="hint">高度（U）由机型自动带出，无需填写；同柜同一 U 位不可重复占用，冲突会在保存时拦截并标红。</p>`,
+    `<button class="btn" onclick="closeModal()">取消</button>
+     <button class="btn primary" onclick="saveDevice(${id || 0})">保存</button>`);
+};
+window.saveDevice = async (id) => {
+  const body = {
+    sku_id: +$('#f_sku').value,
+    code: $('#f_code').value.trim(),
+    sn: $('#f_sn').value.trim(),
+    rack_id: +$('#f_rack').value || 0,
+    u_start: Number($('#f_ustart').value) || 0,
+    purpose: $('#f_purpose').value.trim(),
+    role: $('#f_role').value,
+    state: $('#f_state').value,
+    power_w: Number($('#f_power').value) || 0,
+  };
+  try {
+    if (id) await api('PUT', '/api/devices/' + id, body);
+    else await api('POST', '/api/devices', body);
+    closeModal(); await viewAssetsDevices(); toast('已保存');
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+};
+window.delDevice = async (id) => {
+  if (!await UI.confirm('确认删除该设备？其 U 位占用将同时释放。',
+    { title: '删除设备', okText: '删除', danger: true })) return;
+  try { await api('DELETE', '/api/devices/' + id); await viewAssetsDevices(); toast('已删除'); }
+  catch (e) { toast('删除失败：' + e.message, 'err'); }
+};
+
+/** 资产台账脱敏导出（M6）：列头与服务端写死的 7 列完全一致 —— 无单价、无税率、无含税价。 */
+window.exportAssets = async () => {
+  const exp = await api('GET', '/api/assets/export').catch(() => null);
+  if (!exp || !exp.columns) { toast('导出失败：接口不可用', 'err'); return; }
+  const rows = [['资产编号', '型号', 'SN', '机房', '机柜', 'U位', '状态']];
+  (exp.rows || []).forEach(r => rows.push(r));
+  download('资产台账_' + new Date().toISOString().slice(0, 10) + '.csv', buildCsv(rows));
+  toast('已导出（脱敏版：不含单价、税率、含税价）');
+};
+
+// ---------------- 视图：机房 · 机柜（M2） ----------------
+async function viewAssetsSpace() {
+  const [rooms, racks, devices, units] = await Promise.all([
+    api('GET', '/api/rooms').catch(() => []),
+    api('GET', '/api/racks').catch(() => []),
+    api('GET', '/api/devices').catch(() => []),
+    api('GET', '/api/rack_units').catch(() => []),
+  ]);
+  const usedByRack = {};
+  units.forEach(u => { usedByRack[u.rack_id] = (usedByRack[u.rack_id] || 0) + 1; });
+  const powerByRack = {};
+  devices.forEach(d => {
+    if (!d.rack_id) return;
+    powerByRack[d.rack_id] = (powerByRack[d.rack_id] || 0) + Number(d.power_w || 0);
+  });
+  const totalU = racks.reduce((s, r) => s + Number(r.u_total || 0), 0);
+  const usedU = Object.keys(usedByRack).reduce((s, k) => s + usedByRack[k], 0) / 2;
+  const rackRows = racks.map(r => {
+    const rm = rooms.find(x => x.id === r.room_id);
+    const u = Number(r.u_total || 0);
+    const used = (usedByRack[r.id] || 0) / 2;
+    const rate = u > 0 ? Math.round(used / u * 100) : 0;
+    const pw = powerByRack[r.id] || 0, cap = Number(r.power_capacity_w || 0);
+    return `<tr>
+      <td><b>${esc(r.code || '—')}</b><div class="muted">${esc(rm ? rm.name : '未归属机房')}</div></td>
+      <td class="num">${u}U</td>
+      <td class="num">${used}U<div class="muted">${rate}%</div></td>
+      <td class="num">${cap ? esc(String(Math.round(pw))) + ' / ' + esc(String(cap)) + ' W' : '未配置容量'}</td>
+      <td class="actions" style="margin:0">
+        <button class="btn sm" onclick="location.hash='#/assets/rackview?rack=${r.id}'">U 位视图</button>
+        ${roleCan('write_assets') ? `<button class="btn sm" onclick="editRack(${r.id})">编辑</button>` : ''}</td></tr>`;
+  }).join('');
+  const roomRows = rooms.map(r => `<tr>
+    <td><b>${esc(r.name || '—')}</b></td>
+    <td>${esc(r.building || '')}</td><td class="num">${esc(String(r.floor ?? '—'))}</td>
+    <td class="num">${r.capacity_kw ? esc(String(r.capacity_kw)) + ' kW' : '—'}</td>
+    <td class="num">${racks.filter(x => x.room_id === r.id).length}</td></tr>`).join('');
+
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">机房 · 机柜</h2>
+      <p class="hint">物理空间模型：机房 → 机柜 → U 位。同柜同一 U 位不可重复占用，冲突分「行级重叠 / 超出柜总高 / 功率超容」三类单列。</p></div>
+      <div class="actions" style="margin:0">
+        ${roleCan('write_assets') ? '<button class="btn" onclick="editRoom()">+ 机房</button><button class="btn primary" onclick="editRack()">+ 机柜</button>' : ''}</div></div>
+    <div class="grid-3" style="margin:14px 0">
+      <div class="stat"><div class="n">${rooms.length}</div><div class="l">机房</div></div>
+      <div class="stat"><div class="n">${racks.length}</div><div class="l">机柜</div></div>
+      <div class="stat"><div class="n">${totalU ? Math.round(usedU / totalU * 100) : 0}%</div><div class="l">整体 U 位占用率</div></div>
+    </div>
+    <h3 class="h3">机柜</h3>
+    ${racks.length ? `<table class="tbl"><thead><tr><th>机柜</th><th class="num">总高</th><th class="num">已占用</th><th class="num">功率</th><th></th></tr></thead>
+      <tbody>${rackRows}</tbody></table>`
+      : UI.empty(Icons.server, '还没有机柜', '先建机房，再在机房下建机柜（如 42U 标准柜），之后设备才有可落位的空间',
+          roleCan('write_assets') ? '<button class="btn primary" onclick="editRack()">新建机柜</button>' : '')}
+    <h3 class="h3" style="margin-top:20px">机房</h3>
+    ${rooms.length ? `<table class="tbl"><thead><tr><th>名称</th><th>楼栋</th><th class="num">楼层</th><th class="num">配电容量</th><th class="num">机柜数</th></tr></thead>
+      <tbody>${roomRows}</tbody></table>` : '<p class="hint">尚未建立机房。</p>'}
+  </div>`;
+}
+window.editRoom = () => {
+  modal('新增机房', `<div class="form-grid">
+      <div class="field"><label>名称</label><input id="f_rname" type="text" placeholder="如 A栋 301"></div>
+      <div class="field"><label>楼栋</label><input id="f_rb" type="text" placeholder="如 A"></div>
+      <div class="field"><label>楼层</label><input id="f_rf" type="number" value="1"></div>
+      <div class="field"><label>配电容量(kW)</label><input id="f_rk" type="number" min="0" value="0"></div>
+    </div>`, `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="saveRoom()">保存</button>`);
+};
+window.saveRoom = async () => {
+  const body = { name: $('#f_rname').value.trim(), building: $('#f_rb').value.trim(),
+    floor: Number($('#f_rf').value) || 0, capacity_kw: Number($('#f_rk').value) || 0 };
+  try { await api('POST', '/api/rooms', body); closeModal(); await viewAssetsSpace(); toast('已新建机房'); }
+  catch (e) { toast('保存失败：' + e.message, 'err'); }
+};
+window.editRack = async (id) => {
+  const rooms = await api('GET', '/api/rooms').catch(() => []);
+  let r = null;
+  if (id) {
+    const list = await api('GET', '/api/racks').catch(() => []);
+    r = list.find(x => x.id === id) || null;
+  }
+  const roomOpts = rooms.map(x => `<option value="${x.id}"${r && r.room_id === x.id ? ' selected' : ''}>${esc(x.name || ('机房#' + x.id))}</option>`).join('');
+  modal(id ? ('编辑机柜 #' + id) : '新增机柜', `<div class="form-grid">
+      <div class="field"><label>所属机房</label><select id="f_kroom">${roomOpts || '<option value="">（请先建机房）</option>'}</select></div>
+      <div class="field"><label>机柜编码</label><input id="f_kcode" type="text" value="${esc(r ? r.code || '' : '')}" placeholder="如 A-3"></div>
+      <div class="field"><label>总高(U)</label><input id="f_ktotal" type="number" min="1" value="${r ? r.u_total || 42 : 42}"></div>
+      <div class="field"><label>功率容量(W)</label><input id="f_kpw" type="number" min="0" value="${r ? r.power_capacity_w || 0 : 0}"></div>
+    </div>`, `<button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="saveRack(${id || 0})">保存</button>`);
+};
+window.saveRack = async (id) => {
+  const body = { room_id: +$('#f_kroom').value || 0, code: $('#f_kcode').value.trim(),
+    u_total: Number($('#f_ktotal').value) || 0, power_capacity_w: Number($('#f_kpw').value) || 0 };
+  try {
+    if (id) await api('PUT', '/api/racks/' + id, body);
+    else await api('POST', '/api/racks', body);
+    closeModal(); await viewAssetsSpace(); toast('已保存');
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+};
+
+// ---------------- 视图：U 位视图（M3） ----------------
+/**
+ * 机柜正视 U 位图。服务端判定占用与冲突，前端只渲染。
+ * 0.5 网格：每个半 U 槽位一行（SLOT_H = UNIT_H / 2），
+ * 整 U 设备跨两个槽位、半 U 设备只占一个 —— 二者不错位半格。
+ */
+function renderRackViewSvg(rv) {
+  const UNIT_H = 16;          // 1U 的像素高度
+  const SLOT_H = UNIT_H / 2; // 半 U 槽位高度（0.5 网格）
+  const PAD_L = 34, PAD_T = 6, W = 236;
+  const slots = (rv && rv.slots) || [];
+  const H = PAD_T + slots.length * SLOT_H + 8;
+  const x = PAD_L, w = W - PAD_L - 8;
+  let cells = '';
+  let ticks = '';
+  let labels = '';
+  slots.forEach((s, i) => {
+    const y = PAD_T + i * SLOT_H;
+    let fill = '#f6f7f9', stroke = '#e6e8ec';
+    if (s.occupancy === 'occupied') { fill = '#e5484d'; stroke = '#c8383d'; }
+    else if (s.occupancy === 'reserved') { fill = '#f2c94c'; stroke = '#d4a92c'; }
+    cells += `<rect x="${x}" y="${y}" width="${w}" height="${SLOT_H - 0.5}" fill="${fill}" stroke="${stroke}" stroke-width="0.4"/>`;
+    // 整 U 边界刻度（每 2 个槽位 = 1U）
+    if (i % 2 === 0) {
+      const u = s.u_index / 2;
+      ticks += `<line x1="${x - 4}" y1="${y}" x2="${x}" y2="${y}" stroke="#b9bfc7" stroke-width="0.6"/>`;
+      if (u % 4 === 0) labels += `<text x="${x - 6}" y="${y + SLOT_H}" text-anchor="end" font-size="7" fill="#8b929c">U${u}</text>`;
+    }
+    // 设备标签：只在设备的第一个槽位上写一次
+    if (s.device && s.occupancy === 'occupied' && (s.device.u_size || 1) >= 1) {
+      const top = Math.round(Number(s.device.u_start || 0) * 2) === s.u_index;
+      if (top) {
+        const label = (s.device.code || s.device.sn || '设备').slice(0, 16);
+        labels += `<text x="${x + 4}" y="${y + SLOT_H - 1.5}" font-size="6.5" fill="#fff">${esc(label)}</text>`;
+      }
+    }
+  });
+  return `<svg class="rack-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="机柜 U 位占用图">
+    <rect x="${x - 2}" y="${PAD_T - 2}" width="${w + 4}" height="${slots.length * SLOT_H + 4}" fill="none" stroke="#c9ced6" stroke-width="1"/>
+    ${cells}${ticks}${labels}</svg>`;
+}
+async function viewAssetsRackview() {
+  const racks = await api('GET', '/api/racks').catch(() => []);
+  if (!racks.length) {
+    $('#content').innerHTML = `<div class="card card-pad">${UI.empty(Icons.server,
+      '还没有机柜可看', '先到「机房 · 机柜」建立机柜并录入 U 位占用，再回来看 U 位图',
+      '<button class="btn primary" onclick="location.hash=\'#/assets/space\'">前往机房 · 机柜</button>')}</div>`;
+    return;
+  }
+  // 支持 #/assets/rackview?rack=<id> 直接定位到某个柜
+  const q = (location.hash.split('?')[1] || '');
+  const qid = parseInt((q.split('&').find(p => p.split('=')[0] === 'rack') || ['', '0'])[1], 10) || 0;
+  const rackId = qid || racks[0].id;
+  const rv = await api('GET', '/api/rackview?rack_id=' + rackId).catch(() => null);
+  if (!rv || !rv.rack) {
+    $('#content').innerHTML = `<div class="card card-pad">${UI.empty(Icons.warn, '无法读取该机柜的 U 位数据',
+      '请确认机柜已录入总高（U）后重试', '<button class="btn" onclick="location.hash=\'#/assets/space\'">返回机房 · 机柜</button>')}</div>`;
+    return;
+  }
+  const rackOpts = racks.map(r => `<option value="${r.id}"${r.id === rackId ? ' selected' : ''}>${esc(r.code || ('柜#' + r.id))}</option>`).join('');
+  const c = rv.conflicts || {};
+  const cBlocks = [
+    ['c-overlap', '行级重叠（位置冲突）', c.overlap || []],
+    ['c-height', '超出柜总高（非法位置）', c.over_height || []],
+    ['c-power', '功率超容（资源冲突，不计入 U 位冲突率）', c.power_over || []],
+  ].filter(x => x[2].length);
+  const occ = rv.occupancy || {};
+  const power = rv.power || {};
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">U 位视图</h2>
+      <p class="hint">机柜正视 U 位图：红色为已占用位，黄色为预留位。冲突判定在服务端完成（占用账本逐行唯一），前端只渲染。</p></div>
+      <div class="actions" style="margin:0">
+        <label class="tb-sel"><span>机柜</span><select onchange="gotoRackView(this.value)">${rackOpts}</select></label></div></div>
+    <div class="grid-3" style="margin:14px 0">
+      <div class="stat"><div class="n">${occ.used_slots ?? 0}/${occ.total_slots ?? 0}</div><div class="l">已占用半 U 槽位</div></div>
+      <div class="stat"><div class="n">${power.capacity_w ? Math.round(power.used_w || 0) + ' / ' + power.capacity_w : '未配置'}</div><div class="l">功率占用(W)</div></div>
+      <div class="stat"><div class="n">${(c.overlap || []).length + (c.over_height || []).length}</div><div class="l">位置冲突数</div></div>
+    </div>
+    ${cBlocks.length ? `<div class="conflict-list">${cBlocks.map(b => `<div class="conflict-block ${b[0]}">
+        <div class="conflict-title">${esc(b[1])}（${b[2].length}）</div>
+        <ul>${b[2].slice(0, 8).map(x => `<li>${esc(JSON.stringify(x))}</li>`).join('')}</ul></div>`).join('')}</div>`
+      : '<p class="hint">当前机柜无冲突。</p>'}
+    <div style="margin-top:14px">${renderRackViewSvg(rv)}</div>
+  </div>`;
+}
+window.gotoRackView = (rackId) => { location.hash = '#/assets/rackview?rack=' + rackId; };
+
+// ---------------- 视图：交付批次（M4） ----------------
+async function viewAssetsDeliveries() {
+  const [deliveries, racks] = await Promise.all([
+    api('GET', '/api/deliveries').catch(() => []),
+    api('GET', '/api/racks').catch(() => []),
+  ]);
+  const rackById = {}; racks.forEach(r => { rackById[r.id] = r; });
+  const rows = deliveries.map(d => {
+    const r = d.target_rack_id ? rackById[d.target_rack_id] : null;
+    return `<tr>
+      <td><b>${esc(d.name || ('DEL-' + d.id))}</b><div class="muted">${esc(d.generated_at || '')}</div></td>
+      <td>${d.quote_id ? '报价单 #' + esc(String(d.quote_id)) : '—'}</td>
+      <td>${r ? esc(r.code || ('柜#' + r.id)) : '未指定'}</td>
+      <td class="num">${(d.devices || []).length || d.device_count || 0}</td>
+      <td><span class="state-tag st-planned">待上架</span></td>
+      <td class="actions" style="margin:0">
+        <button class="btn sm" onclick="viewDelivery(${d.id})">展开</button></td></tr>`;
+  }).join('');
+  $('#content').innerHTML = `<div class="card card-pad">
+    <div class="toolbar"><div><h2 class="h2">交付批次</h2>
+      <p class="hint">报价单按行拆成 N 台设备实例并预分配 U 位，形成待上架批次。到货扫码录 SN 后在设备台账改状态。</p></div>
+      <div class="actions" style="margin:0">
+        ${roleCan('manage_deliveries') ? '<button class="btn primary" onclick="genDelivery()">从报价单生成</button>' : ''}</div></div>
+    ${deliveries.length ? `<table class="tbl"><thead><tr><th>批次</th><th>来源报价单</th><th>目标机柜</th><th class="num">设备数</th><th>状态</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`
+      : UI.empty(Icons.truck, '还没有交付批次', '在报价单上点「生成交付清单」，系统会按行拆成设备并预分配 U 位',
+          roleCan('manage_deliveries') ? '<button class="btn primary" onclick="genDelivery()">从报价单生成</button>' : '')}
+  </div>`;
+}
+window.genDelivery = async () => {
+  const quotes = await api('GET', '/api/quotes').catch(() => []);
+  const racks = await api('GET', '/api/racks').catch(() => []);
+  if (!quotes.length) { toast('还没有报价单：交付批次由报价单按行拆解生成', 'err'); return; }
+  if (!racks.length) { toast('还没有机柜：设备需要落位，请先建立机柜', 'err'); return; }
+  const qOpts = quotes.map(q => `<option value="${q.id}">${esc(q.name || ('报价单#' + q.id))}（${q.item_count || 0} 条）</option>`).join('');
+  const rOpts = racks.map(r => `<option value="${r.id}">${esc(r.code || ('柜#' + r.id))}（${r.u_total || 0}U）</option>`).join('');
+  modal('从报价单生成交付批次', `<div class="form-grid">
+      <div class="field"><label>报价单</label><select id="f_dq">${qOpts}</select></div>
+      <div class="field"><label>目标机柜</label><select id="f_drack">${rOpts}</select></div>
+    </div>
+    <p class="hint">按报价条目「物理机」行展开为设备实例，虚拟机不占物理 U 位；U 位在目标柜内自动避让已占位。</p>`,
+    `<button class="btn" onclick="closeModal()">取消</button>
+     <button class="btn" onclick="genDeliveryDry()">仅预演</button>
+     <button class="btn primary" onclick="genDeliveryGo()">生成</button>`);
+};
+window.genDeliveryDry = async () => {
+  try {
+    const d = await api('POST', '/api/deliveries', {
+      quote_id: +$('#f_dq').value, target_rack_id: +$('#f_drack').value, dry_run: true });
+    closeModal();
+    modal('预演结果', `<p class="hint">按当前占用账本预演（不写库）：将展开 ${d.device_count || 0} 台设备。
+      ${(d.conflicts && d.conflicts.overlap && d.conflicts.overlap.length) ? '存在 ' + d.conflicts.overlap.length + ' 处无可行解位。' : '未发现位置冲突。'}</p>`,
+      '<button class="btn primary" onclick="closeModal()">知道了</button>');
+  } catch (e) { toast('预演失败：' + e.message, 'err'); }
+};
+window.genDeliveryGo = async () => {
+  try {
+    const d = await api('POST', '/api/deliveries', {
+      quote_id: +$('#f_dq').value, target_rack_id: +$('#f_drack').value });
+    closeModal(); await viewAssetsDeliveries();
+    toast('已生成 ' + (d.device_count || 0) + ' 台设备');
+  } catch (e) { toast('生成失败：' + e.message, 'err'); }
+};
+window.viewDelivery = async (id) => {
+  const d = await api('GET', '/api/deliveries/' + id).catch(() => null);
+  if (!d || !d.id) { toast('未找到该交付批次', 'err'); return; }
+  const devs = d.devices || [];
+  const rows = devs.map(x => `<tr>
+    <td>${esc(x.sn || '未录 SN')}</td>
+    <td>${esc(x.arch || '')}</td>
+    <td>${esc(x.purpose || '—')}${x.role ? ' · ' + esc(x.role) : ''}</td>
+    <td>${x.rack_id ? '柜#' + esc(String(x.rack_id)) + ' · U' + Number(x.u_start || 0) : '未分配'}</td>
+    <td>${esc(x.source_line_uid || '')}</td></tr>`).join('');
+  modal('交付批次：' + (d.name || ('DEL-' + d.id)), `
+    <p class="hint">来源报价单 ${d.quote_id ? '#' + esc(String(d.quote_id)) : '—'} ｜ 设备 ${devs.length} 台 ｜ 生成于 ${esc(d.generated_at || '')}</p>
+    ${devs.length ? `<table><thead><tr><th>SN</th><th>架构</th><th>用途</th><th>位置</th><th>锚点</th></tr></thead><tbody>${rows}</tbody></table>`
+      : '<p class="hint">该批次暂无设备明细。</p>'}`,
+    '<button class="btn primary" onclick="closeModal()">关闭</button>');
+};
+
+// ---------------- 视图：资产侧概览（非售前角色） ----------------
+/**
+ * 管理层（viewer）：报价总价汇总 + 资产落位概览，不含任何明细价格。
+ * 交付 / 运维（delivery / ops）：物理落位、U 位占用与冲突，不含任何价格。
+ */
+async function viewAssetsDashboard(role) {
+  const [devices, racks, rooms, deliveries] = await Promise.all([
+    api('GET', '/api/devices').catch(() => []),
+    api('GET', '/api/racks').catch(() => []),
+    api('GET', '/api/rooms').catch(() => []),
+    api('GET', '/api/deliveries').catch(() => []),
+  ]);
+  let quotes = [];
+  if (role === 'viewer') {
+    // viewer 读报价走服务端投影（只有含税总价汇总，无条目明细）
+    quotes = await api('GET', '/api/quotes').catch(() => []);
+  }
+  const totalU = racks.reduce((s, r) => s + Number(r.u_total || 0), 0);
+  const usedU = devices.filter(d => d.rack_id)
+    .reduce((s, d) => s + Number(d.u_size || 1), 0);
+  const runtime = devices.filter(d => ASSET_RUNTIME_STATES.indexOf(d.state) >= 0).length;
+  const pending = devices.filter(d => ASSET_PLAN_STATES.indexOf(d.state) >= 0).length;
+  const totalCents = quotes.reduce((s, q) => s + Number(q.total_cents || 0), 0);
+  const cards = [
+    { lbl: '设备总数', val: devices.length, unit: '台', foot: `待上架 ${pending} · 运行态 ${runtime}`, c: 'var(--brand-d)', ico: Icons.server, view: 'assets/devices' },
+    { lbl: '机柜数', val: racks.length, unit: '个', foot: `机房 ${rooms.length} 个 · 总 ${totalU}U`, c: 'var(--info)', ico: Icons.grid, view: 'assets/space' },
+    { lbl: 'U 位占用率', val: totalU ? Math.round(usedU / totalU * 100) : 0, unit: '%', foot: `已占用 ${usedU}U / ${totalU}U`, c: 'var(--warn)', ico: Icons.chart, view: 'assets/rackview' },
+    { lbl: '交付批次', val: deliveries.length, unit: '批', foot: '报价单按行拆分为设备实例', c: 'var(--text-1)', ico: Icons.truck, view: 'assets/deliveries' },
+  ];
+  if (role === 'viewer') {
+    cards.push({ lbl: '报价单含税总价', val: fmt(totalCents), unit: '元', foot: `${quotes.length} 份报价单（仅汇总，不含明细）`, c: 'var(--brand-d)', ico: Icons.doc, view: 'quotes' });
+  }
+  const statCards = cards.map(c => `
+    <div class="stat clickable v-brand" style="--c:${c.c}" onclick="location.hash='#/${c.view}'">
+      <span class="stat-go">${Icons.arrow}</span>
+      <div class="stat-lbl">${c.ico}<span>${esc(c.lbl)}</span></div>
+      <div class="stat-val" style="color:${c.c}">${esc(String(c.val))}<small>${esc(c.unit)}</small></div>
+      <div class="stat-foot">${esc(c.foot)}</div>
+    </div>`).join('');
+  const todos = [];
+  if (!racks.length) todos.push({ k: 'danger', t: '尚未建立机柜，设备无处落位', v: '去建立', view: 'assets/space' });
+  if (pending) todos.push({ k: 'warn', t: `${pending} 台设备处于待上架状态`, v: '去上架', view: 'assets/devices' });
+  if (!deliveries.length) todos.push({ k: 'ok', t: '尚未生成交付批次', v: '去生成', view: 'assets/deliveries' });
+  const weak = devices.filter(d => !d.source_line_uid).length;
+  if (weak) todos.push({ k: 'warn', t: `${weak} 台设备缺少报价锚点（弱锚点）`, v: '去核对', view: 'assets/devices' });
+  const todoHtml = todos.length ? todos.map(t => `
+    <div class="todo-item" onclick="location.hash='#/${t.view}'">
+      <span class="todo-dot ${t.k}"></span><span class="todo-t">${esc(t.t)}</span><span class="todo-v">${esc(t.v)} →</span>
+    </div>`).join('') : UI.empty(Icons.warn, '没有待处理事项', '资产台账状态正常');
+  const quoteRows = quotes.length ? quotes.map(q => `
+    <tr><td><b>${esc(q.name || '—')}</b></td>
+      <td class="num">${q.item_count != null ? q.item_count : '—'}</td>
+      <td class="num"><b>${fmt(q.total_cents || 0)}</b></td>
+      <td class="muted">${esc(q.created_at || '')}</td></tr>`).join('') : '';
+  $('#content').innerHTML = `
+  <div class="dash-grid">${statCards}</div>
+  <div class="dash-section"><h2>待办与风险</h2><span class="sub">${esc(roleLabel(role))}视角</span></div>
+  <div class="dash-2col">
+    <div class="card">
+      <div class="card-head" style="padding:14px 18px 0"><h3 class="h3" style="margin:0">需要关注</h3></div>
+      <div class="card-body"><div class="todo-list">${todoHtml}</div></div>
+    </div>
+    <div class="card">
+      <div class="card-head" style="padding:14px 18px 0"><h3 class="h3" style="margin:0">角色可见范围</h3></div>
+      <div class="card-body"><div class="hint">${esc(roleScopeText(role))}</div></div>
+    </div>
+  </div>
+  ${role === 'viewer' ? `<div class="dash-section"><h2>报价总价汇总</h2>
+    <span class="sub">仅含税总价与条目数，不含条目明细</span></div>
+  <div class="card">
+    ${quotes.length ? `<table class="tbl"><thead><tr><th>名称</th><th class="num">条目</th><th class="num">含税总价(元)</th><th>创建时间</th></tr></thead>
+      <tbody>${quoteRows}</tbody></table>` : UI.empty(Icons.doc, '还没有报价单', '报价单保存后，这里只显示含税总价汇总')}
+  </div>` : ''}`;
+}
+function roleLabel(role) {
+  const hit = ROLE_OPTIONS.find(o => o.v === role);
+  return hit ? hit.label : role;
+}
+function roleScopeText(role) {
+  if (role === 'viewer') return '管理层视角：可见报价单含税总价汇总与资产落位概览；条目明细、单价库与采价记录不可见。';
+  if (role === 'delivery') return '交付视角：可见设备台账、机房机柜、U 位视图与交付批次；单价库与报价单不可见（服务端 403）。';
+  return '运维视角：可见设备台账、机房机柜、U 位视图；可提交采价反馈与上架预校验；单价库与报价单不可见（服务端 403）。';
+}
+
+// ---------------- 上架可行性预校验（M7） ----------------
+/** 预校验按「配置台的物理机行」计算上架需求，只读空间模型，不写任何数据。 */
+let _pcLines = [];
+window.openPlacementCheck = async () => {
+  const racks = await api('GET', '/api/racks').catch(() => []);
+  if (!racks.length) {
+    toast('还没有机柜：预校验需要先建立机柜并录入 U 位占用', 'err');
+    return;
+  }
+  _pcLines = CFG.phys.map(l => ({ machine_id: l.machineId, qty: l.qty || 1 }));
+  if (!_pcLines.length) {
+    toast('配置台还没有物理机行：预校验按物理机行计算上架需求', 'warn');
+    return;
+  }
+  const qty = _pcLines.reduce((s, l) => s + l.qty, 0);
+  const opts = racks.map(r => `<option value="${r.id}">${esc(r.code || ('柜#' + r.id))}（${r.u_total || 0}U）</option>`).join('');
+  modal('上架可行性预校验', `<div class="form-grid">
+      <div class="field"><label>目标机柜</label><select id="f_pcrack">${opts}</select></div>
+    </div>
+    <div class="hint">按配置台 ${_pcLines.length} 行物理机（共 ${qty} 台）做只读预校验：只算不写 —— 不改设备、不改占用账本、不改报价。</div>`,
+    `<button class="btn" onclick="closeModal()">取消</button>
+     <button class="btn primary" onclick="runPlacementCheck()">开始校验</button>`);
+};
+window.runPlacementCheck = async () => {
+  try {
+    const v = await api('POST', '/api/space/validate', {
+      rack_id: +$('#f_pcrack').value, lines: _pcLines });
+    closeModal();
+    showPlacementResult(v);
+  } catch (e) { toast('校验失败：' + e.message, 'err'); }
+};
+function showPlacementResult(v) {
+  const c = v.conflicts || {};
+  const cnt = (k) => (c[k] || []).length;
+  const blocks = [
+    ['c-overlap', '行级重叠（位置冲突，计入 U 位冲突率）', c.overlap || []],
+    ['c-height', '超出柜总高（非法位置率，单列）', c.over_height || []],
+    ['c-power', '功率超容（资源冲突，不计入 U 位冲突率）', c.power_over || []],
+  ];
+  const degraded = v.mode !== 'spatial';
+  const rate = (v.u_conflict_rate != null ? (v.u_conflict_rate * 100).toFixed(1) : '0.0');
+  modal('预校验结果', `
+    <p class="hint">模式：<b>${degraded ? '纸面校验（空间数据不足）' : '空间校验'}</b> ｜ 待上架 ${v.onboarded_device_count || 0} 台
+      ｜ 冲突设备 ${v.conflict_device_count || 0} 台 ｜ U 位冲突率 ${rate}%
+      ｜ 无可行解位比例 ${((v.infeasible_ratio || 0) * 100).toFixed(1)}%</p>
+    ${degraded ? '<div class="conflict-block c-height"><div class="conflict-title">空间数据完整率不足，已降级为纸面校验</div><ul>' +
+      (v.notes || []).map(n => `<li>${esc(n)}</li>`).join('') + '</ul></div>' : ''}
+    ${blocks.filter(b => b[2].length).map(b => `<div class="conflict-block ${b[0]}">
+        <div class="conflict-title">${esc(b[1])}（${b[2].length}）</div>
+        <ul>${b[2].slice(0, 10).map(x => `<li>${esc(JSON.stringify(x))}</li>`).join('')}</ul></div>`).join('')}
+    ${!blocks.some(b => b[2].length) && !degraded ? '<p class="hint">未发现位置冲突，该批次可在目标柜上架。</p>' : ''}
+    <p class="hint">指标口径：U 位冲突率 = 冲突设备数 ÷ 上架设备数（不用「拦截次数÷尝试次数」，后者含重试会被放大）。</p>`,
+    '<button class="btn primary" onclick="closeModal()">知道了</button>');
+}
 
 // ---------------- 视图：架构梳理 ----------------
 async function viewArch() {
@@ -1919,7 +3480,7 @@ async function viewArch() {
     </div>
     <h3 class="h3">一、部署组件 / 资源清单</h3>
     <table><thead><tr><th>部署组件(用途)</th><th>归入分组</th><th>资源类型</th><th>规格 / 机型</th><th class="num">数量</th><th class="num">单价(元)</th><th class="num">小计(元)</th><th>互联组件</th></tr></thead>
-    <tbody>${rows.join('') || '<tr><td colspan="8" class="empty">尚未在配置台添加任何服务器</td></tr>'}</tbody></table>
+    <tbody>${rows.join('') || '<tr><td colspan="8">${UI.empty(Icons.box, "尚未在配置台添加任何服务器", "配置台的每一行都会在这里汇总为部署架构")}</td></tr>'}</tbody></table>
     <datalist id="purposeRegistryList">${purposeRegistry().map(p => `<option value="${esc(p)}">`).join('')}</datalist>
     <h3 class="h3" style="margin-top:18px">二、拓扑互联关系</h3>
     ${linkRows.length ? `<table><thead><tr><th>节点 A（部署组件）</th><th></th><th>节点 B（部署组件）</th></tr></thead><tbody>${linkRows.join('')}</tbody></table>` : '<p class="muted">尚未在拓扑白板中建立任何连线。进入「配置台 → 拓扑白板 → 连线模式」，点选两个节点即可建立互联关系。</p>'}
