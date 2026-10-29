@@ -7,12 +7,15 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const SUITES = [
+  ['verify-syntax.js', '前端语法 / 引用'],
   ['test-hcl.js', '硬件清单解析'],
   ['test-arch.js', '架构图'],
   ['test-quote.js', '报价链路 / 配置台'],
   ['test-app-smoke.js', 'SPA 冒烟'],
   ['verify-layout.js', '配置台布局'],
   ['verify-xlsx.js', 'xlsx 导出'],
+  ['test-fusion.js', '融合模型单测'],
+  ['test-backend.js', '后端 API 契约'],
   ['test-docs.js', '文档一致性'],
 ];
 
