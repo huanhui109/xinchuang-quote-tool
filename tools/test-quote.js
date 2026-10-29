@@ -67,6 +67,7 @@ vm.runInThisContext(fs.readFileSync('web/arch-diagram.js', 'utf8'), { filename: 
 vm.runInThisContext(fs.readFileSync('web/hcl-core.js', 'utf8'), { filename: 'hcl-core.js' });
 vm.runInThisContext(fs.readFileSync('web/xlsx-read.js', 'utf8'), { filename: 'xlsx-read.js' });
 vm.runInThisContext(fs.readFileSync('web/hcl-view.js', 'utf8'), { filename: 'hcl-view.js' });
+vm.runInThisContext(fs.readFileSync('web/ui.js', 'utf8'), { filename: 'ui.js' });
 vm.runInThisContext(fs.readFileSync('web/app.js', 'utf8'), { filename: 'app.js' });
 
 const ready = loadLib();
@@ -471,6 +472,31 @@ T('请求体大小上限生效（D-5）', async () => {
 T('静态服务路径穿越防护仍在', async () => {
   const src = fs.readFileSync('server.py', 'utf8');
   ok(src.indexOf('fp.startswith(WEB_DIR)') >= 0, '应保留 WEB_DIR 前缀校验');
+});
+
+// ================================================================ 融合模型口径（M1–M7）
+group('融合模型口径钉死（U 位换算 / 高度权威 / 路径段解析）');
+T('U 位换算口径钉死：u_index = round(u × 2)（前后端同口径，半 U 精度）', async () => {
+  const py = fs.readFileSync('server.py', 'utf8');
+  const body = py.slice(py.indexOf('def u_index_of'), py.indexOf('def device_u_indices'));
+  ok(/return int\(round\(float\(u\) \* 2\)\)/.test(body), '后端 u_index_of 应为 round(u × 2)');
+  ok(/def device_u_indices\(u_start, u_size\)/.test(py), '后端应有设备槽位区间函数');
+  const js = fs.readFileSync('web/app.js', 'utf8');
+  ok(/function uIndexOf\(u\)\s*\{\s*return Math\.round\(Number\(u \|\| 0\) \* 2\);/.test(js),
+    '前端 uIndexOf 应与后端同口径');
+});
+T('设备高度由服务端带出，不采信客户端传入的 u_size', async () => {
+  const py = fs.readFileSync('server.py', 'utf8');
+  const body = py.slice(py.indexOf('def device_create'), py.indexOf('def device_update'));
+  ok(/"u_size": u\["u_size"\]/.test(body), 'device_create 应以机型算出的 u_size 落库');
+  ok(!/b\.get\("u_size"\)/.test(body), 'device_create 不应采信客户端传入的 u_size');
+  ok(/"u_size_source": u\["u_size_source"\]/.test(body), 'u_size_source 应由服务端标注来源');
+});
+T('query 参数并入路径段后不得再裸 int(seg[1])（否则 ValueError 变 500）', async () => {
+  const py = fs.readFileSync('server.py', 'utf8');
+  ok(/def seg_id\(seg, idx=1\)/.test(py), '应有 seg_id 辅助函数');
+  ok(!/int\(seg\[1\]\)/.test(py), 'server.py 内不应再有裸 int(seg[1])');
+  ok(py.indexOf('unquote(pair)') >= 0, 'query 参数应做 URL 解码');
 });
 
 // ================================================================ 阶段3

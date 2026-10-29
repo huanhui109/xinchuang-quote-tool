@@ -29,6 +29,7 @@ vm.runInThisContext(fs.readFileSync('web/arch-diagram.js','utf8'),{filename:'arc
 vm.runInThisContext(fs.readFileSync('web/hcl-core.js','utf8'),{filename:'hcl-core.js'});
 vm.runInThisContext(fs.readFileSync('web/xlsx-read.js','utf8'),{filename:'xlsx-read.js'});
 vm.runInThisContext(fs.readFileSync('web/hcl-view.js','utf8'),{filename:'hcl-view.js'});
+vm.runInThisContext(fs.readFileSync('web/ui.js','utf8'),{filename:'ui.js'});
 try{
   vm.runInThisContext(fs.readFileSync('web/app.js','utf8'),{filename:'app.js'});
   console.log('[PASS] app.js 顶层执行无异常（离线回退模式）');
@@ -89,6 +90,34 @@ try{
       if(html.length<20) throw new Error('路由 '+h+' 渲染内容为空');
     }
     console.log('[PASS] 全部菜单路由渲染无异常');
+    // 5.5) 资产侧 4 个新路由：必须渲染出资产侧视图，不能是回落的概览页
+    //      （ROUTES 里没注册的 key 会回落到 viewDashboard，同样渲染出几千字符 —— 那是假通过）
+    const assetRoutes=[
+      ['#/assets/devices',['设备台账','资产编号']],
+      ['#/assets/space',['机房','机柜']],
+      ['#/assets/rackview',['U 位','机柜']],
+      ['#/assets/deliveries',['交付批次','报价单']],
+    ];
+    for(const routePair of assetRoutes){
+      global.location.hash=routePair[0]; await route();
+      const html=String(document.querySelector('#content').innerHTML||'');
+      if(html.indexOf('加载失败')>=0) throw new Error('资产侧路由 '+routePair[0]+' 渲染失败');
+      const miss=routePair[1].filter(k=>html.indexOf(k)<0);
+      if(miss.length) throw new Error('资产侧路由 '+routePair[0]+' 未命中特征词 '+miss.join('/')+'（疑似回落到概览页）');
+    }
+    console.log('[PASS] 资产侧 4 路由渲染出各自视图（未回落概览页）');
+    // 5.6) 角色回归：概览按角色分叉 + 角色来回切换后数据能恢复
+    await setRole('ops');
+    global.location.hash='#/dashboard'; await route();
+    const opsHtml=String(document.querySelector('#content').innerHTML||'');
+    if(opsHtml.indexOf('加载失败')>=0) throw new Error('ops 概览渲染失败');
+    if(opsHtml.indexOf('设备总数')<0) throw new Error('ops 概览未分叉为资产侧视图（仍显示售前仪表盘）');
+    await setRole('sales');
+    if(!S.machines.length) throw new Error('角色切回 sales 后单价库数据未恢复（loadLib 缓存命中未回写 S）');
+    global.location.hash='#/dashboard'; await route();
+    const salesHtml=String(document.querySelector('#content').innerHTML||'');
+    if(salesHtml.indexOf('设备总数')>=0) throw new Error('sales 概览未走售前仪表盘（被资产侧视图污染）');
+    console.log('[PASS] 角色分叉：ops 概览走资产侧；切回 sales 后单价库数据与售前仪表盘均恢复');
     // 6) 硬件清单解析：离线模式下解析真实清单并应用到配置台
     const fx=JSON.parse(fs.readFileSync(path.join(__dirname,'fixtures','sample-wide-spec.json'),'utf8'));
     const pr=HclCore.parseWorkbook(fx,{machines:S.machines});
